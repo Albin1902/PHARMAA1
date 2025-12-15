@@ -2,10 +2,8 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
-
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageEnhance
 
 # -----------------------------
 # Config
@@ -20,7 +18,6 @@ SEARCH_COLUMNS = ["brand_name", "DIN", "generic_name", "category", "form", "syno
 # Local assets folder (can be committed if not huge)
 ASSETS_BY_NAME_DIR = Path("assets/meds_by_name")
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-
 # Phrase -> extra tokens (added to query)
 PHRASE_MAP: Dict[str, List[str]] = {
     "blue inhaler": ["salbutamol", "ventolin", "rescue", "reliever", "puffer", "hfa", "inhaler"],
@@ -32,7 +29,6 @@ PHRASE_MAP: Dict[str, List[str]] = {
     "injection pen": ["pen", "injection", "ozempic", "wegovy"],
     "nasal spray": ["spray", "nasal"],
 }
-
 TOKEN_MAP: Dict[str, List[str]] = {
     "bp": ["blood pressure", "hypertension"],
     "uti": ["urinary", "infection"],
@@ -40,7 +36,6 @@ TOKEN_MAP: Dict[str, List[str]] = {
     "blood": ["anticoagulant", "clot", "stroke"],
     "allergy": ["hay fever", "antihistamine"],
 }
-
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -88,7 +83,6 @@ def load_data(path: str) -> pd.DataFrame:
             df = pd.read_csv(path, dtype={"DIN": str}, encoding="utf-8-sig")
         except UnicodeDecodeError:
             df = pd.read_csv(path, dtype={"DIN": str}, encoding="cp1252")
-
     for col in SEARCH_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -153,7 +147,7 @@ def pick_first(paths: List[Path]) -> Optional[Path]:
     return paths[0] if paths else None
 
 # -----------------------------
-# UI Setup
+# UI
 # -----------------------------
 st.set_page_config(
     page_title="SDM Medication Navigator",
@@ -172,16 +166,13 @@ with st.sidebar:
     st.divider()
     st.write("**Images folder**")
     st.code(str((repo_root() / ASSETS_BY_NAME_DIR).resolve()), language="text")
+    st.caption("Folder name must match slug(brand_name). Example: alysena-28-100-20-mcg-4")
 
 df = load_data(data_path)
-display_cols = ["brand_name", "generic_name", "DIN", "category", "form", "synonyms"]
-display_cols = [c for c in display_cols if c in df.columns]
 
-tabs = st.tabs(["🔍 Medication Search", "🖼️ Patient Profile Analyzer"])
+tabs = st.tabs(["Medication Search", "Patient Profile Analyzer"])
 
-# =============================
-# Tab 1: Medication Search (original)
-# =============================
+# ==================== Medication Search Tab ====================
 with tabs[0]:
     st.title("💊 SDM Medication Navigator")
     st.caption("Search by brand/generic/category/form/synonyms • Optional local images • Internal use")
@@ -223,6 +214,8 @@ with tabs[0]:
         filtered = filtered[mask]
 
     st.subheader(f"Results ({len(filtered)})")
+    display_cols = ["brand_name", "generic_name", "DIN", "category", "form", "synonyms"]
+    display_cols = [c for c in display_cols if c in filtered.columns]
     st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True)
 
     csv_bytes = filtered[display_cols].to_csv(index=False).encode("utf-8-sig")
@@ -233,97 +226,97 @@ with tabs[0]:
         mime="text/csv",
     )
 
-    if show_images and len(filtered) > 0:
+    if show_images:
         st.divider()
         st.subheader("Quick preview")
-        brand_list = filtered["brand_name"].astype(str).tolist()
-        chosen = st.selectbox("Select a medication (type to search)", brand_list)
-        row = filtered[filtered["brand_name"] == chosen].iloc[0]
+        if len(filtered) == 0:
+            st.info("No results to preview. Search something first.")
+        else:
+            brand_list = filtered["brand_name"].astype(str).tolist()
+            chosen = st.selectbox("Select a medication (type to search)", brand_list)
+            row = filtered[filtered["brand_name"] == chosen].iloc[0]
 
-        info = f"""
+            info = f"""
 **Brand:** {row.get('brand_name','')}
 **Generic:** {row.get('generic_name','')}
 **Category:** {row.get('category','')}
 **Form:** {row.get('form','')}
 **DIN:** {row.get('DIN','')}
 """
-        st.markdown(info)
+            st.markdown(info)
 
-        imgs = find_images_for_brand_name(row.get("brand_name", ""))
-        with st.expander("Where to put images for this medication", expanded=False):
-            st.code(str(imgs["folder"]), language="text")
-            st.caption("Add files like: box.jpg, pill.jpg (or .png/.webp).")
+            imgs = find_images_for_brand_name(row.get("brand_name", ""))
+            with st.expander("Where to put images for this medication", expanded=False):
+                st.code(str(imgs["folder"]), language="text")
+                st.caption("Add files like: box.jpg, pill.jpg (or .png/.webp).")
 
-        if not (imgs["box"] or imgs["pill"] or imgs["other"]):
-            st.warning("No images found for this medication yet.")
-        else:
-            box_img = pick_first(imgs["box"])
-            pill_img = pick_first(imgs["pill"])
-            if box_img or pill_img:
-                colA, colB = st.columns(2)
-                with colA:
-                    st.write("**Box**")
-                    if box_img:
-                        st.image(str(box_img), use_container_width=True)
-                    else:
-                        st.caption("No box image.")
-                with colB:
-                    st.write("**Pill / Tablet**")
-                    if pill_img:
-                        st.image(str(pill_img), use_container_width=True)
-                    else:
-                        st.caption("No pill image.")
+            if not (imgs["box"] or imgs["pill"] or imgs["other"]):
+                st.warning("No images found for this medication yet.")
+            else:
+                box_img = pick_first(imgs["box"])
+                pill_img = pick_first(imgs["pill"])
+                if box_img or pill_img:
+                    colA, colB = st.columns(2)
+                    with colA:
+                        st.write("**Box**")
+                        if box_img:
+                            st.image(str(box_img), use_container_width=True)
+                        else:
+                            st.caption("No box image.")
+                    with colB:
+                        st.write("**Pill / Tablet**")
+                        if pill_img:
+                            st.image(str(pill_img), use_container_width=True)
+                        else:
+                            st.caption("No pill image.")
 
-            remaining = imgs["box"][1:] + imgs["pill"][1:] + imgs["other"]
-            if remaining:
-                with st.expander("More images", expanded=False):
-                    st.image([str(p) for p in remaining], use_container_width=True)
+                remaining = imgs["box"][1:] + imgs["pill"][1:] + imgs["other"]
+                if remaining:
+                    with st.expander("More images", expanded=False):
+                        st.image([str(p) for p in remaining], use_container_width=True)
 
-# =============================
-# Tab 2: Patient Profile Analyzer
-# =============================
+# ==================== Patient Profile Analyzer Tab ====================
 with tabs[1]:
-    st.header("🖼️ Patient Profile Analyzer")
-    st.caption("Upload a screenshot of the patient's Healthwatch profile and tell us what type of medication you're looking for (e.g., diabetes, cholesterol, blood pressure).")
+    st.header("Patient Profile Analyzer")
+    st.caption("Upload a screenshot of the patient's Healthwatch profile. Specify what medication type you're looking for (e.g., 'diabetes', 'cholesterol', 'blood pressure').")
 
     prompt = st.text_input(
         "What medication are you looking for?",
-        placeholder="e.g., diabetes medication, statin, blood thinner, inhaler",
+        placeholder="e.g., diabetes medication, statin for cholesterol, blood thinner",
         key="analyzer_prompt"
     )
 
     uploaded_file = st.file_uploader(
-        "Upload screenshot",
+        "Upload screenshot (JPG, PNG)",
         type=["jpg", "jpeg", "png"],
-        key="analyzer_upload",
-        help="Take a clear screenshot of the medication list in the patient's profile."
+        key="analyzer_upload"
     )
 
     if uploaded_file and prompt:
         try:
+            from PIL import Image, ImageEnhance
             import pytesseract
-        except ImportError:
-            st.error("Missing package: `pip install pytesseract pillow`")
+        except ImportError as e:
+            st.error("Missing required packages. Add to requirements.txt:\n\npillow\npytesseract")
             st.stop()
 
-        # Uncomment and adjust if running on Windows
-        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+        # No need to set tesseract_cmd on Streamlit Cloud (it's in PATH after packages.txt install)
 
-        with st.spinner("Extracting text from the screenshot..."):
+        with st.spinner("Extracting text from screenshot..."):
             img = Image.open(uploaded_file)
 
-            # Preprocess for better OCR: grayscale + contrast boost
-            img = img.convert('L')
+            # Preprocessing for better OCR accuracy
+            img = img.convert('L')  # grayscale
             enhancer = ImageEnhance.Contrast(img)
             img = enhancer.enhance(2.0)
 
-            # Use English + French language pack (common in Canada)
+            # English + French language pack (common in Canadian pharmacy contexts)
             text = pytesseract.image_to_string(img, lang='eng+fra').lower()
 
-        with st.expander("Extracted text (for debugging)", expanded=False):
+        with st.expander("Raw extracted text (for debugging)", expanded=False):
             st.text(text)
 
-        # Find medications that appear in the extracted text
+        # Detect medications mentioned in the extracted text
         found_meds = []
         for _, row in df.iterrows():
             brand = normalize_text(row.get('brand_name', ''))
@@ -332,40 +325,41 @@ with tabs[1]:
 
             if (brand and brand in text) or \
                (generic and generic in text) or \
-               (synonyms and any(s in text for s in re.split(r'\s+', synonyms) if len(s) > 3)):
+               (synonyms and any(s in text for s in [normalize_text(w) for w in synonyms.split() if len(w) > 3])):
                 found_meds.append(row)
 
         if not found_meds:
-            st.info("No medications from the database were detected in the screenshot.")
+            st.info("No known medications from the database were detected in the screenshot.")
+            st.stop()
+
+        found_df = pd.DataFrame(found_meds)
+
+        # Filter based on user's prompt
+        expanded_prompt = expand_query(prompt)
+        if expanded_prompt.strip():
+            blobs = found_df.apply(row_search_blob, axis=1)
+            mask = blobs.apply(lambda b: matches_query(b, expanded_prompt))
+            matching_df = found_df[mask]
         else:
-            found_df = pd.DataFrame(found_meds)
+            matching_df = found_df
 
-            # Apply user's prompt filter
-            expanded_prompt = expand_query(prompt)
-            if expanded_prompt.strip():
-                blobs = found_df.apply(row_search_blob, axis=1)
-                mask = blobs.apply(lambda b: matches_query(b, expanded_prompt))
-                matching_df = found_df[mask]
-            else:
-                matching_df = found_df
+        if matching_df.empty:
+            st.warning(f"Medications were detected, but none match your request ('{prompt}'). All detected medications:")
+            st.dataframe(found_df[display_cols], use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ Matching medication(s) found for refill!")
+            st.write("The following appear in the patient's profile and match your query:")
 
-            if matching_df.empty:
-                st.warning(f"Medications were detected, but none match your request: '{prompt}'")
-                st.dataframe(found_df[display_cols], use_container_width=True, hide_index=True)
-            else:
-                st.success("✅ Matching medication(s) found!")
-                st.write("The following medication(s) appear in the patient's profile and match what you're looking for:")
-
-                for _, med in matching_df.iterrows():
-                    brand = med.get('brand_name', 'Unknown')
-                    st.markdown(f"**{brand}** – this is likely the medication that needs a refill.")
-                    details = f"""
-- **Generic:** {med.get('generic_name', '')}
+            for _, med in matching_df.iterrows():
+                brand = med.get('brand_name', 'Unknown')
+                st.markdown(f"**{brand}** – this is the medication that likely needs a refill.")
+                details = f"""
+- **Generic name:** {med.get('generic_name', '')}
 - **Category:** {med.get('category', '')}
 - **Form:** {med.get('form', '')}
 - **DIN:** {med.get('DIN', '')}
 - **Synonyms:** {med.get('synonyms', '')}
 """
-                    st.markdown(details)
+                st.markdown(details)
 
-                st.dataframe(matching_df[display_cols], use_container_width=True, hide_index=True)
+            st.dataframe(matching_df[display_cols], use_container_width=True, hide_index=True)
