@@ -1,3 +1,7 @@
 streamlit
 pandas
 openpyxl
+Pillow
+easyocr
+rapidfuzz
+numpy
