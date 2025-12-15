@@ -2,8 +2,10 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
+
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageEnhance
 
 # -----------------------------
 # Config
@@ -18,6 +20,7 @@ SEARCH_COLUMNS = ["brand_name", "DIN", "generic_name", "category", "form", "syno
 # Local assets folder (can be committed if not huge)
 ASSETS_BY_NAME_DIR = Path("assets/meds_by_name")
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
 # Phrase -> extra tokens (added to query)
 PHRASE_MAP: Dict[str, List[str]] = {
     "blue inhaler": ["salbutamol", "ventolin", "rescue", "reliever", "puffer", "hfa", "inhaler"],
@@ -29,6 +32,7 @@ PHRASE_MAP: Dict[str, List[str]] = {
     "injection pen": ["pen", "injection", "ozempic", "wegovy"],
     "nasal spray": ["spray", "nasal"],
 }
+
 TOKEN_MAP: Dict[str, List[str]] = {
     "bp": ["blood pressure", "hypertension"],
     "uti": ["urinary", "infection"],
@@ -36,25 +40,25 @@ TOKEN_MAP: Dict[str, List[str]] = {
     "blood": ["anticoagulant", "clot", "stroke"],
     "allergy": ["hay fever", "antihistamine"],
 }
+
 # -----------------------------
 # Helpers
 # -----------------------------
 def repo_root() -> Path:
-    # Streamlit Cloud runs from repo root; locally it also works.
     return Path(__file__).resolve().parent
+
 def resolve_path(rel_or_abs: str) -> str:
     p = Path(rel_or_abs)
     if p.is_absolute():
         return str(p)
     return str((repo_root() / p).resolve())
+
 def _find_data_path() -> str:
-    # allow env override first
     envp = os.environ.get("SDM_DATA_PATH", "").strip()
     if envp:
         ep = Path(envp)
         if ep.exists():
             return str(ep)
-        # if env path is relative
         ep2 = Path(resolve_path(envp))
         if ep2.exists():
             return str(ep2)
@@ -63,6 +67,7 @@ def _find_data_path() -> str:
         if rp.exists():
             return str(rp)
     return ""
+
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
     if not path:
@@ -79,27 +84,25 @@ def load_data(path: str) -> pd.DataFrame:
     if ext in [".xlsx", ".xls"]:
         df = pd.read_excel(path, dtype={"DIN": str})
     else:
-        # CSV: handle Windows encodings
         try:
             df = pd.read_csv(path, dtype={"DIN": str}, encoding="utf-8-sig")
         except UnicodeDecodeError:
             df = pd.read_csv(path, dtype={"DIN": str}, encoding="cp1252")
-    # ensure cols
+
     for col in SEARCH_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    # normalize NaNs/types
     for col in SEARCH_COLUMNS:
         df[col] = df[col].astype(str).replace({"nan": "", "None": ""}).fillna("")
-    # DIN digits only (still useful)
     df["DIN"] = df["DIN"].apply(lambda x: re.sub(r"\D", "", str(x)))
-    # trim brand names
     df["brand_name"] = df["brand_name"].astype(str).str.strip()
     return df
+
 def normalize_text(s: str) -> str:
     s = str(s).lower().strip()
     s = re.sub(r"\s+", " ", s)
     return s
+
 def expand_query(q: str) -> str:
     qn = normalize_text(q)
     extra: List[str] = []
@@ -111,36 +114,29 @@ def expand_query(q: str) -> str:
         if t in TOKEN_MAP:
             extra.extend(TOKEN_MAP[t])
     return " ".join([qn] + extra).strip()
+
 def row_search_blob(row: pd.Series) -> str:
-    parts = []
-    for col in SEARCH_COLUMNS:
-        parts.append(str(row.get(col, "")))
+    parts = [str(row.get(col, "")) for col in SEARCH_COLUMNS]
     return normalize_text(" | ".join(parts))
+
 def matches_query(blob: str, expanded_query: str) -> bool:
     if not expanded_query:
         return True
     words = [w for w in re.split(r"\s+", expanded_query) if w]
     return all(w in blob for w in words)
+
 def detect_missing(row: pd.Series) -> bool:
     return any(not str(row.get(c, "")).strip() for c in ["generic_name", "category", "form"])
+
 def slugify(name: str) -> str:
-    """
-    Converts brand_name to a folder-safe slug.
-    Must match your folder names.
-    """
     s = str(name or "").strip().lower()
-    # common mojibake cleanup
     s = s.replace("Ã©", "e").replace("â€", "").replace("â€™", "'").replace("Â", "")
     s = s.replace("§", "").replace("’", "'")
-    # only letters/numbers, others -> "-"
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-+", "-", s).strip("-")
     return s
+
 def find_images_for_brand_name(brand_name: str) -> dict:
-    """
-    Looks in assets/meds_by_name/<slug(brand_name)> for images.
-    Returns {folder, box, pill, other}
-    """
     folder = (repo_root() / ASSETS_BY_NAME_DIR / slugify(brand_name)).resolve()
     if not folder.exists():
         return {"folder": folder, "box": [], "pill": [], "other": []}
@@ -149,17 +145,20 @@ def find_images_for_brand_name(brand_name: str) -> dict:
     pill = sorted([p for p in files if p.stem.lower().startswith(("pill", "tablet", "cap", "capsule"))])
     other = sorted([p for p in files if p not in box and p not in pill])
     return {"folder": folder, "box": box, "pill": pill, "other": other}
+
 def safe_str(x) -> str:
     return "" if x is None else str(x)
+
 def pick_first(paths: List[Path]) -> Optional[Path]:
     return paths[0] if paths else None
+
 # -----------------------------
-# UI (mobile-friendly)
+# UI Setup
 # -----------------------------
 st.set_page_config(
     page_title="SDM Medication Navigator",
     layout="wide",
-    initial_sidebar_state="collapsed", # better on mobile
+    initial_sidebar_state="collapsed",
 )
 
 data_path = _find_data_path()
@@ -173,15 +172,20 @@ with st.sidebar:
     st.divider()
     st.write("**Images folder**")
     st.code(str((repo_root() / ASSETS_BY_NAME_DIR).resolve()), language="text")
-    st.caption("Folder name must match slug(brand_name). Example: alysena-28-100-20-mcg-4")
+
 df = load_data(data_path)
+display_cols = ["brand_name", "generic_name", "DIN", "category", "form", "synonyms"]
+display_cols = [c for c in display_cols if c in df.columns]
 
-tabs = st.tabs(["Medication Search", "Patient Profile Analyzer"])
+tabs = st.tabs(["🔍 Medication Search", "🖼️ Patient Profile Analyzer"])
 
+# =============================
+# Tab 1: Medication Search (original)
+# =============================
 with tabs[0]:
     st.title("💊 SDM Medication Navigator")
     st.caption("Search by brand/generic/category/form/synonyms • Optional local images • Internal use")
-    # compact controls row (better UX)
+
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         search = st.text_input(
@@ -193,8 +197,9 @@ with tabs[0]:
         only_missing = st.checkbox("Missing only", value=False)
     with c3:
         show_images = st.checkbox("Show images", value=True)
+
     expanded = expand_query(search)
-    # filters in an expander (cleaner on mobile)
+
     with st.expander("Filters", expanded=False):
         categories = ["All"] + sorted([c for c in df["category"].unique().tolist() if safe_str(c).strip()])
         forms = ["All"] + sorted([f for f in df["form"].unique().tolist() if safe_str(f).strip()])
@@ -203,7 +208,7 @@ with tabs[0]:
             cat = st.selectbox("Category", categories, index=0)
         with fc2:
             form = st.selectbox("Form", forms, index=0)
-    # Apply filters
+
     filtered = df.copy()
     if cat != "All":
         filtered = filtered[filtered["category"].astype(str) == cat]
@@ -211,16 +216,15 @@ with tabs[0]:
         filtered = filtered[filtered["form"].astype(str) == form]
     if only_missing:
         filtered = filtered[filtered.apply(detect_missing, axis=1)]
-    # Search
+
     if expanded.strip():
         blobs = filtered.apply(row_search_blob, axis=1)
         mask = blobs.apply(lambda b: matches_query(b, expanded))
         filtered = filtered[mask]
+
     st.subheader(f"Results ({len(filtered)})")
-    display_cols = ["brand_name", "generic_name", "DIN", "category", "form", "synonyms"]
-    display_cols = [c for c in display_cols if c in filtered.columns]
     st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True)
-    # download
+
     csv_bytes = filtered[display_cols].to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Download current results as CSV",
@@ -228,123 +232,115 @@ with tabs[0]:
         file_name="sdm_medications_filtered.csv",
         mime="text/csv",
     )
-    # -----------------------------
-    # Autocomplete + images viewer
-    # -----------------------------
-    if show_images:
+
+    if show_images and len(filtered) > 0:
         st.divider()
         st.subheader("Quick preview")
-        if len(filtered) == 0:
-            st.info("No results to preview. Search something first.")
-        else:
-            # Autocomplete select: Streamlit selectbox already provides type-to-search
-            # For mobile: keep it simple
-            brand_list = filtered["brand_name"].astype(str).tolist()
-            chosen = st.selectbox("Select a medication (type to search)", brand_list)
-            row = filtered[filtered["brand_name"] == chosen].iloc[0]
-            # info card
-            info = f"""
+        brand_list = filtered["brand_name"].astype(str).tolist()
+        chosen = st.selectbox("Select a medication (type to search)", brand_list)
+        row = filtered[filtered["brand_name"] == chosen].iloc[0]
+
+        info = f"""
 **Brand:** {row.get('brand_name','')}
 **Generic:** {row.get('generic_name','')}
 **Category:** {row.get('category','')}
 **Form:** {row.get('form','')}
 **DIN:** {row.get('DIN','')}
 """
-            st.markdown(info)
-            imgs = find_images_for_brand_name(row.get("brand_name", ""))
-            # folder help
-            with st.expander("Where to put images for this medication", expanded=False):
-                st.code(str(imgs["folder"]), language="text")
-                st.caption("Add files like: box.jpg, pill.jpg (or .png/.webp).")
-            if not (imgs["box"] or imgs["pill"] or imgs["other"]):
-                st.warning("No images found for this medication yet.")
-            else:
-                # SIDE-BY-SIDE for box + pill
-                box_img = pick_first(imgs["box"])
-                pill_img = pick_first(imgs["pill"])
-                if box_img or pill_img:
-                    colA, colB = st.columns(2)
-                    with colA:
-                        st.write("**Box**")
-                        if box_img:
-                            st.image(str(box_img), use_container_width=True)
-                        else:
-                            st.caption("No box image.")
-                    with colB:
-                        st.write("**Pill / Tablet**")
-                        if pill_img:
-                            st.image(str(pill_img), use_container_width=True)
-                        else:
-                            st.caption("No pill image.")
-                # show remaining images smaller (optional)
-                remaining = []
-                for p in imgs["box"][1:]:
-                    remaining.append(p)
-                for p in imgs["pill"][1:]:
-                    remaining.append(p)
-                for p in imgs["other"]:
-                    remaining.append(p)
-                if remaining:
-                    with st.expander("More images", expanded=False):
-                        st.image([str(p) for p in remaining], use_container_width=True)
+        st.markdown(info)
 
+        imgs = find_images_for_brand_name(row.get("brand_name", ""))
+        with st.expander("Where to put images for this medication", expanded=False):
+            st.code(str(imgs["folder"]), language="text")
+            st.caption("Add files like: box.jpg, pill.jpg (or .png/.webp).")
+
+        if not (imgs["box"] or imgs["pill"] or imgs["other"]):
+            st.warning("No images found for this medication yet.")
+        else:
+            box_img = pick_first(imgs["box"])
+            pill_img = pick_first(imgs["pill"])
+            if box_img or pill_img:
+                colA, colB = st.columns(2)
+                with colA:
+                    st.write("**Box**")
+                    if box_img:
+                        st.image(str(box_img), use_container_width=True)
+                    else:
+                        st.caption("No box image.")
+                with colB:
+                    st.write("**Pill / Tablet**")
+                    if pill_img:
+                        st.image(str(pill_img), use_container_width=True)
+                    else:
+                        st.caption("No pill image.")
+
+            remaining = imgs["box"][1:] + imgs["pill"][1:] + imgs["other"]
+            if remaining:
+                with st.expander("More images", expanded=False):
+                    st.image([str(p) for p in remaining], use_container_width=True)
+
+# =============================
+# Tab 2: Patient Profile Analyzer
+# =============================
 with tabs[1]:
-    st.header("Patient Profile Analyzer")
-    st.caption("Upload a screenshot of the patient's Healthwatch profile and specify what you're looking for (e.g., 'diabetes medication'). The app will attempt to identify matching medications from the profile.")
-    
+    st.header("🖼️ Patient Profile Analyzer")
+    st.caption("Upload a screenshot of the patient's Healthwatch profile and tell us what type of medication you're looking for (e.g., diabetes, cholesterol, blood pressure).")
+
     prompt = st.text_input(
-        "What are you looking for?",
-        placeholder="e.g., diabetes medication, cholesterol pill",
-        label_visibility="visible",
+        "What medication are you looking for?",
+        placeholder="e.g., diabetes medication, statin, blood thinner, inhaler",
+        key="analyzer_prompt"
     )
-    
+
     uploaded_file = st.file_uploader(
-        "Upload or drop screenshot here",
+        "Upload screenshot",
         type=["jpg", "jpeg", "png"],
-        help="Drag and drop or click to upload. Pasting directly isn't supported natively, but you can save the pasted image and upload it."
+        key="analyzer_upload",
+        help="Take a clear screenshot of the medication list in the patient's profile."
     )
-    
+
     if uploaded_file and prompt:
         try:
-            from PIL import Image
             import pytesseract
         except ImportError:
-            st.error("""
-            Required libraries not found. Please install them:
-            
-            pip install pillow pytesseract
-            
-            Also, install Tesseract OCR on your system:
-            - On Ubuntu: sudo apt install tesseract-ocr
-            - On macOS: brew install tesseract
-            - On Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
-            - Then set the path if needed: pytesseract.pytesseract.tesseract_cmd = r'<path_to_tesseract.exe>'
-            """)
+            st.error("Missing package: `pip install pytesseract pillow`")
             st.stop()
-        
-        # Optional: Set Tesseract path if needed (uncomment and adjust)
-        # pytesseract.pytesseract.tesseract_cmd = r'/usr/local/bin/tesseract'  # Example for macOS
-        
-        img = Image.open(uploaded_file)
-        text = pytesseract.image_to_string(img).lower()
-        
-        with st.expander("Extracted text from screenshot (for debugging)", expanded=False):
+
+        # Uncomment and adjust if running on Windows
+        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+        with st.spinner("Extracting text from the screenshot..."):
+            img = Image.open(uploaded_file)
+
+            # Preprocess for better OCR: grayscale + contrast boost
+            img = img.convert('L')
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(2.0)
+
+            # Use English + French language pack (common in Canada)
+            text = pytesseract.image_to_string(img, lang='eng+fra').lower()
+
+        with st.expander("Extracted text (for debugging)", expanded=False):
             st.text(text)
-        
-        # Find medications mentioned in the text by matching against the dataframe
+
+        # Find medications that appear in the extracted text
         found_meds = []
         for _, row in df.iterrows():
-            brand_norm = normalize_text(row.get('brand_name', ''))
-            generic_norm = normalize_text(row.get('generic_name', ''))
-            if brand_norm in text or generic_norm in text:
+            brand = normalize_text(row.get('brand_name', ''))
+            generic = normalize_text(row.get('generic_name', ''))
+            synonyms = normalize_text(row.get('synonyms', ''))
+
+            if (brand and brand in text) or \
+               (generic and generic in text) or \
+               (synonyms and any(s in text for s in re.split(r'\s+', synonyms) if len(s) > 3)):
                 found_meds.append(row)
-        
+
         if not found_meds:
             st.info("No medications from the database were detected in the screenshot.")
         else:
             found_df = pd.DataFrame(found_meds)
-            
-            # Expand the user's prompt and filter the found meds
+
+            # Apply user's prompt filter
             expanded_prompt = expand_query(prompt)
             if expanded_prompt.strip():
                 blobs = found_df.apply(row_search_blob, axis=1)
@@ -352,13 +348,17 @@ with tabs[1]:
                 matching_df = found_df[mask]
             else:
                 matching_df = found_df
-            
+
             if matching_df.empty:
-                st.info("No medications in the profile match your query.")
+                st.warning(f"Medications were detected, but none match your request: '{prompt}'")
+                st.dataframe(found_df[display_cols], use_container_width=True, hide_index=True)
             else:
-                st.subheader("Identified medication(s) that may need refill:")
+                st.success("✅ Matching medication(s) found!")
+                st.write("The following medication(s) appear in the patient's profile and match what you're looking for:")
+
                 for _, med in matching_df.iterrows():
-                    st.markdown(f"**{med.get('brand_name', 'Unknown')}** in the profile is the medication that needs refill.")
+                    brand = med.get('brand_name', 'Unknown')
+                    st.markdown(f"**{brand}** – this is likely the medication that needs a refill.")
                     details = f"""
 - **Generic:** {med.get('generic_name', '')}
 - **Category:** {med.get('category', '')}
@@ -367,5 +367,5 @@ with tabs[1]:
 - **Synonyms:** {med.get('synonyms', '')}
 """
                     st.markdown(details)
-                
+
                 st.dataframe(matching_df[display_cols], use_container_width=True, hide_index=True)
