@@ -1,7 +1,7 @@
 streamlit
 pandas
-openpyxl
-Pillow
 easyocr
-rapidfuzz
-numpy
+torch
+torchvision
+torchaudio
+--extra-index-url https://download.pytorch.org/whl/cpu   # This line ensures CPU-only torch (smaller/faster build on Streamlit)
