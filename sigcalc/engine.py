@@ -72,10 +72,6 @@ def normalize_code(s: str) -> str:
 # Frequency parsing
 # -----------------------------
 def administrations_per_day(freq: str) -> Optional[float]:
-    """
-    Convert frequency code (e.g., 'bid', 'hs', 'q6h') into administrations/day.
-    Returns None if it cannot be determined.
-    """
     f = normalize_code(freq).replace(" ", "")
     if not f:
         return None
@@ -138,22 +134,20 @@ def round_up_to_step(value: float, step: float) -> float:
 # -----------------------------
 @dataclass(frozen=True)
 class Sig:
-    dose_qty: float                 # e.g., 1 (per administration)
-    form: str                       # tab/cap/ml/g
-    route: str                      # PO/SL/Top/etc (store code)
-    freq: str                       # bid/q6h/etc (store code)
-    timing: Optional[List[str]] = None   # ["pc"] etc
+    dose_qty: float
+    form: str
+    route: str
+    freq: str
+    timing: Optional[List[str]] = None
     prn: bool = False
     indication: Optional[str] = None
-    max_freq_if_prn: Optional[str] = None  # for PRN calculations (e.g., q6h)
+    max_freq_if_prn: Optional[str] = None
+
+    # ✅ NEW: allow extra “STAT” doses (e.g., 1 now + BID x 7 days = 15 total)
+    stat_extra_doses: int = 0
 
 
 def render_sig(sig: Sig, mode: str = "abbrev") -> str:
-    """
-    mode:
-      - "abbrev": returns abbreviations (fast entry)
-      - "full": returns full plain-English style
-    """
     mode = normalize_code(mode)
     timing_list = sig.timing or []
 
@@ -172,7 +166,6 @@ def render_sig(sig: Sig, mode: str = "abbrev") -> str:
             if sig.indication:
                 prn_part += f" for {sig.indication}"
 
-        # Example: "Take 1 tablet(s) by mouth twice daily after meals as needed for pain"
         parts = [dose_part]
         if route_part:
             parts.append(route_part)
@@ -205,7 +198,7 @@ def render_sig(sig: Sig, mode: str = "abbrev") -> str:
 def calc_qty_needed(sig: Sig, days: float) -> Dict[str, Any]:
     """
     Quantity needed for given days:
-      qty = days * dose_qty * administrations_per_day(freq)
+      qty = days * dose_qty * administrations_per_day(freq) + (stat_extra_doses * dose_qty)
     If PRN: requires max_freq_if_prn to compute worst-case qty.
     """
     if days <= 0:
@@ -230,7 +223,8 @@ def calc_qty_needed(sig: Sig, days: float) -> Dict[str, Any]:
     if apd is None:
         return {"ok": False, "error": f"Unrecognized frequency: '{freq_for_calc}'", "warnings": []}
 
-    qty_exact = days * sig.dose_qty * apd
+    # ✅ NEW: add extra STAT doses
+    qty_exact = (days * sig.dose_qty * apd) + (sig.stat_extra_doses * sig.dose_qty)
 
     return {
         "ok": True,
@@ -243,7 +237,7 @@ def calc_qty_needed(sig: Sig, days: float) -> Dict[str, Any]:
 def calc_days_supply(sig: Sig, qty_dispensed: float) -> Dict[str, Any]:
     """
     Days supply from quantity dispensed:
-      days = qty_dispensed / (dose_qty * administrations_per_day(freq))
+      days = (qty_dispensed - stat_extra_doses*dose_qty) / (dose_qty * administrations_per_day(freq))
     If PRN: requires max_freq_if_prn to compute max-use days supply.
     """
     if qty_dispensed <= 0:
@@ -269,7 +263,18 @@ def calc_days_supply(sig: Sig, qty_dispensed: float) -> Dict[str, Any]:
         return {"ok": False, "error": f"Unrecognized frequency: '{freq_for_calc}'", "warnings": []}
 
     per_day = sig.dose_qty * apd
-    days_exact = qty_dispensed / per_day
+
+    # ✅ NEW: subtract STAT extra doses first
+    extra = sig.stat_extra_doses * sig.dose_qty
+    remaining = qty_dispensed - extra
+    if remaining <= 0:
+        return {
+            "ok": False,
+            "error": "Quantity dispensed is not enough to cover the extra STAT dose(s).",
+            "warnings": ["Increase quantity or set STAT extra doses to 0."],
+        }
+
+    days_exact = remaining / per_day
 
     return {
         "ok": True,
