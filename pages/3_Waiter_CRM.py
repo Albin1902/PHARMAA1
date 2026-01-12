@@ -200,7 +200,7 @@ if search:
 # Build a dataframe for clean display
 table_rows = []
 for r in rows:
-    rem_txt, is_over, rem_secs = remaining(r["due_at"])
+    rem_txt, is_over, _ = remaining(r["due_at"])
     table_rows.append({
         "id": r["id"],
         "patient": r["patient"],
@@ -209,11 +209,20 @@ for r in rows:
         "created": fmt_local(r["created_at"]),
         "due": fmt_local(r["due_at"]),
         "remaining": rem_txt,
-        "overdue": is_over,
+        "overdue": bool(is_over),
         "status": r["status"],
     })
 
+EXPECTED_COLS = ["id", "patient", "medication", "note", "created", "due", "remaining", "overdue", "status"]
 df = pd.DataFrame(table_rows)
+
+# FIX: if there are 0 rows, df has 0 columns -> KeyError on df["status"]
+if df.empty:
+    df = pd.DataFrame(columns=EXPECTED_COLS)
+else:
+    for c in EXPECTED_COLS:
+        if c not in df.columns:
+            df[c] = ""
 
 active_df = df[df["status"] == "active"].copy()
 overdue_df = active_df[active_df["overdue"] == True].copy()
