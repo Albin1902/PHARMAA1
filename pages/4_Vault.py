@@ -56,6 +56,12 @@ def sha256(s: str) -> str:
 if "vault_unlocked" not in st.session_state:
     st.session_state.vault_unlocked = False
 
+if "selected_vault_id" not in st.session_state:
+    st.session_state.selected_vault_id = None
+
+if "show_secret" not in st.session_state:
+    st.session_state.show_secret = False
+
 with st.sidebar:
     st.header("Vault Lock")
 
@@ -66,8 +72,9 @@ with st.sidebar:
     correct_pin_hash = sha256(str(st.secrets["VAULT_PIN"]).strip())
 
     pin = st.text_input("Enter PIN", type="password", placeholder="PIN", key="vault_pin_entry")
-    colu1, colu2 = st.columns(2)
-    with colu1:
+
+    c_unlock, c_lock = st.columns(2)
+    with c_unlock:
         if st.button("Unlock", use_container_width=True):
             if sha256(pin.strip()) == correct_pin_hash:
                 st.session_state.vault_unlocked = True
@@ -77,7 +84,7 @@ with st.sidebar:
                 st.session_state.vault_unlocked = False
                 st.error("Wrong PIN.")
 
-    with colu2:
+    with c_lock:
         if st.session_state.vault_unlocked:
             if st.button("Lock", use_container_width=True):
                 st.session_state.vault_unlocked = False
@@ -85,7 +92,7 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    st.session_state.show_secret = st.toggle("Show saved secret", value=st.session_state.get("show_secret", False))
+    st.session_state.show_secret = st.toggle("Show saved secret", value=st.session_state.show_secret)
 
 if not st.session_state.vault_unlocked:
     st.info("Vault is locked. Enter PIN in the sidebar to unlock.")
@@ -137,31 +144,26 @@ def delete_item(item_id: int):
         conn.commit()
 
 # -----------------------------
-# Add new entry
+# Add new entry (FORM) ✅
 # -----------------------------
 st.subheader("Add new entry")
 
-c1, c2 = st.columns([1.15, 1])
-with c1:
-    new_label = st.text_input("Label (where is this used?)", placeholder="e.g., Canada Life portal", key="new_label")
-    new_login = st.text_input("Login ID / Username", placeholder="email / username", key="new_login")
-with c2:
-    new_secret = st.text_area("Password / Notes", height=110, placeholder="Password, security answer, notes...", key="new_secret")
+with st.form("add_vault_form", clear_on_submit=True):
+    c1, c2 = st.columns([1.15, 1])
+    with c1:
+        new_label = st.text_input("Label (where is this used?)", placeholder="e.g., Canada Life portal")
+        new_login = st.text_input("Login ID / Username", placeholder="email / username")
+    with c2:
+        new_secret = st.text_area("Password / Notes", height=110, placeholder="Password, security answer, notes...")
 
-if st.button("Save", type="primary"):
+    submitted = st.form_submit_button("Save", type="primary")
+
+if submitted:
     if not new_label.strip() or not new_login.strip() or not new_secret.strip():
         st.error("Need Label + Login ID + Password/Notes.")
     else:
         new_id = add_item(new_label, new_login, new_secret)
-
-        # Auto-select the newly saved entry
-        st.session_state["selected_vault_id"] = new_id
-
-        # Clear inputs for next save
-        st.session_state["new_label"] = ""
-        st.session_state["new_login"] = ""
-        st.session_state["new_secret"] = ""
-
+        st.session_state.selected_vault_id = new_id
         st.success("Saved.")
         st.rerun()
 
@@ -171,10 +173,9 @@ st.divider()
 # View/Edit
 # -----------------------------
 items = fetch_all()
-
 st.subheader("Saved entries")
 
-search = st.text_input("Search", placeholder="filter by label or login id", key="vault_search").strip().lower()
+search = st.text_input("Search", placeholder="filter by label or login id").strip().lower()
 
 filtered = items
 if search:
@@ -187,30 +188,21 @@ if not filtered:
     st.info("No entries match your search.")
     st.stop()
 
-# Build options (stable)
-options = {f"{it['label']} / {it['login_id']}  (#{it['id']})": it["id"] for it in filtered}
-labels = list(options.keys())
+# options
+labels = [f"{it['label']} / {it['login_id']}  (#{it['id']})" for it in filtered]
+id_by_label = {lab: filtered[i]["id"] for i, lab in enumerate(labels)}
 
-# Choose default selection:
-# - if we have selected_vault_id in session, use it if present in filtered
-# - else choose first item
-selected_id = st.session_state.get("selected_vault_id", None)
+# choose default selection
 default_index = 0
-if selected_id is not None:
-    # find the label that maps to selected_id
-    for i, lab in enumerate(labels):
-        if options[lab] == selected_id:
+if st.session_state.selected_vault_id is not None:
+    for i, it in enumerate(filtered):
+        if it["id"] == st.session_state.selected_vault_id:
             default_index = i
             break
 
-picked_label = st.selectbox(
-    "Select an entry",
-    options=labels,
-    index=default_index,
-    key="vault_selectbox",
-)
-item_id = options[picked_label]
-st.session_state["selected_vault_id"] = item_id  # keep stable
+picked = st.selectbox("Select an entry", options=labels, index=default_index)
+item_id = id_by_label[picked]
+st.session_state.selected_vault_id = item_id
 
 item = next(i for i in items if i["id"] == item_id)
 
@@ -218,21 +210,17 @@ left, right = st.columns([1.2, 1])
 
 with left:
     st.markdown("### Edit")
-
     edit_label = st.text_input("Label", value=item["label"], key="edit_label")
     edit_login = st.text_input("Login ID", value=item["login_id"], key="edit_login")
 
-    if st.session_state.get("show_secret", False):
+    if st.session_state.show_secret:
         edit_secret = st.text_area("Password / Notes", value=item["secret_note"], height=160, key="edit_secret")
     else:
-        # Show masked version, but still allow editing via separate box
         st.text_area("Password / Notes (hidden)", value="•" * 12, height=80, disabled=True)
-        edit_secret = st.text_area("New Password / Notes (optional)", value="", height=120, key="edit_secret_new")
-        if not edit_secret.strip():
-            edit_secret = item["secret_note"]  # keep old if blank
+        edit_secret_new = st.text_area("New Password / Notes (optional)", value="", height=120, key="edit_secret_new")
+        edit_secret = item["secret_note"] if not edit_secret_new.strip() else edit_secret_new
 
     b1, b2 = st.columns([1, 1])
-
     with b1:
         if st.button("Update", type="primary", use_container_width=True):
             update_item(item_id, edit_label, edit_login, edit_secret)
@@ -244,11 +232,11 @@ with left:
         if st.button("Delete", use_container_width=True, disabled=not confirm):
             delete_item(item_id)
             st.success("Deleted.")
-            st.session_state["selected_vault_id"] = None
+            st.session_state.selected_vault_id = None
             st.rerun()
 
 with right:
     st.markdown("### Info")
     st.write(f"**Created:** {item['created_at']}")
     st.write(f"**Updated:** {item['updated_at']}")
-    st.caption("PIN lock stops casual access. Data is still stored as plain text in SQLite.")
+    st.caption("PIN lock stops casual access. Data is stored as plain text in SQLite.")
