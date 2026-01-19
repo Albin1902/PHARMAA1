@@ -12,7 +12,7 @@ import streamlit as st
 # -----------------------------
 st.set_page_config(page_title="Vault", layout="wide")
 st.title("Vault (PIN Locked)")
-st.caption("Stores IDs/password notes locally in SQLite. Use at your own risk. Avoid storing real pharmacy system credentials on a public app.")
+st.caption("Simple vault: pick a label -> view saved Login ID + Password/Notes. Avoid storing real pharmacy system creds in a public app.")
 
 # -----------------------------
 # DB setup (reuse same DB file)
@@ -56,12 +56,6 @@ def sha256(s: str) -> str:
 if "vault_unlocked" not in st.session_state:
     st.session_state.vault_unlocked = False
 
-if "selected_vault_id" not in st.session_state:
-    st.session_state.selected_vault_id = None
-
-if "show_secret" not in st.session_state:
-    st.session_state.show_secret = False
-
 with st.sidebar:
     st.header("Vault Lock")
 
@@ -71,10 +65,10 @@ with st.sidebar:
 
     correct_pin_hash = sha256(str(st.secrets["VAULT_PIN"]).strip())
 
-    pin = st.text_input("Enter PIN", type="password", placeholder="PIN", key="vault_pin_entry")
+    pin = st.text_input("Enter PIN", type="password", placeholder="PIN")
+    col1, col2 = st.columns(2)
 
-    c_unlock, c_lock = st.columns(2)
-    with c_unlock:
+    with col1:
         if st.button("Unlock", use_container_width=True):
             if sha256(pin.strip()) == correct_pin_hash:
                 st.session_state.vault_unlocked = True
@@ -84,7 +78,7 @@ with st.sidebar:
                 st.session_state.vault_unlocked = False
                 st.error("Wrong PIN.")
 
-    with c_lock:
+    with col2:
         if st.session_state.vault_unlocked:
             if st.button("Lock", use_container_width=True):
                 st.session_state.vault_unlocked = False
@@ -92,14 +86,15 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    st.session_state.show_secret = st.toggle("Show saved secret", value=st.session_state.show_secret)
+    show_secret = st.toggle("Show password/notes", value=st.session_state.get("show_secret", False))
+    st.session_state["show_secret"] = show_secret
 
 if not st.session_state.vault_unlocked:
     st.info("Vault is locked. Enter PIN in the sidebar to unlock.")
     st.stop()
 
 # -----------------------------
-# CRUD functions
+# CRUD helpers
 # -----------------------------
 def fetch_all():
     with get_conn() as conn:
@@ -125,118 +120,97 @@ def add_item(label: str, login_id: str, secret_note: str) -> int:
         conn.commit()
         return int(cur.lastrowid)
 
-def update_item(item_id: int, label: str, login_id: str, secret_note: str):
-    now = utc_iso()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE vault_notes
-            SET label=?, login_id=?, secret_note=?, updated_at=?
-            WHERE id=?
-            """,
-            (label.strip(), login_id.strip(), secret_note.strip(), now, item_id),
-        )
-        conn.commit()
-
 def delete_item(item_id: int):
     with get_conn() as conn:
         conn.execute("DELETE FROM vault_notes WHERE id=?", (item_id,))
         conn.commit()
 
 # -----------------------------
-# Add new entry (FORM) ✅
+# Add entry (optional, still simple)
 # -----------------------------
-st.subheader("Add new entry")
+with st.expander("Add new entry", expanded=False):
+    with st.form("add_vault_form", clear_on_submit=True):
+        c1, c2 = st.columns([1.2, 1])
+        with c1:
+            new_label = st.text_input("Label", placeholder="e.g., Canada Life portal")
+            new_login = st.text_input("Login ID / Username", placeholder="email / username")
+        with c2:
+            new_secret = st.text_area("Password / Notes", height=100, placeholder="password / notes...")
 
-with st.form("add_vault_form", clear_on_submit=True):
-    c1, c2 = st.columns([1.15, 1])
-    with c1:
-        new_label = st.text_input("Label (where is this used?)", placeholder="e.g., Canada Life portal")
-        new_login = st.text_input("Login ID / Username", placeholder="email / username")
-    with c2:
-        new_secret = st.text_area("Password / Notes", height=110, placeholder="Password, security answer, notes...")
+        submitted = st.form_submit_button("Save", type="primary")
 
-    submitted = st.form_submit_button("Save", type="primary")
-
-if submitted:
-    if not new_label.strip() or not new_login.strip() or not new_secret.strip():
-        st.error("Need Label + Login ID + Password/Notes.")
-    else:
-        new_id = add_item(new_label, new_login, new_secret)
-        st.session_state.selected_vault_id = new_id
-        st.success("Saved.")
-        st.rerun()
+    if submitted:
+        if not new_label.strip() or not new_login.strip() or not new_secret.strip():
+            st.error("Need Label + Login ID + Password/Notes.")
+        else:
+            new_id = add_item(new_label, new_login, new_secret)
+            st.success("Saved.")
+            st.session_state["selected_vault_id"] = new_id
+            st.rerun()
 
 st.divider()
 
 # -----------------------------
-# View/Edit
+# Dropdown -> show selected
 # -----------------------------
 items = fetch_all()
-st.subheader("Saved entries")
-
-search = st.text_input("Search", placeholder="filter by label or login id").strip().lower()
-
-filtered = items
-if search:
-    filtered = [
-        it for it in items
-        if search in (it["label"] + " " + it["login_id"]).lower()
-    ]
-
-if not filtered:
-    st.info("No entries match your search.")
+if not items:
+    st.info("No saved entries yet.")
     st.stop()
 
-# options
-labels = [f"{it['label']} / {it['login_id']}  (#{it['id']})" for it in filtered]
-id_by_label = {lab: filtered[i]["id"] for i, lab in enumerate(labels)}
+search = st.text_input("Search label", placeholder="type to filter").strip().lower()
+filtered = items if not search else [it for it in items if search in it["label"].lower()]
 
-# choose default selection
+if not filtered:
+    st.info("No entries match that search.")
+    st.stop()
+
+# Build dropdown labels
+labels = [f"{it['label']}  (#{it['id']})" for it in filtered]
+id_by_label = {labels[i]: filtered[i]["id"] for i in range(len(filtered))}
+
+# Default selection
 default_index = 0
-if st.session_state.selected_vault_id is not None:
+sel_id = st.session_state.get("selected_vault_id")
+if sel_id is not None:
     for i, it in enumerate(filtered):
-        if it["id"] == st.session_state.selected_vault_id:
+        if it["id"] == sel_id:
             default_index = i
             break
 
-picked = st.selectbox("Select an entry", options=labels, index=default_index)
+picked = st.selectbox("Choose saved entry", options=labels, index=default_index)
 item_id = id_by_label[picked]
-st.session_state.selected_vault_id = item_id
+st.session_state["selected_vault_id"] = item_id
 
 item = next(i for i in items if i["id"] == item_id)
 
-left, right = st.columns([1.2, 1])
+st.subheader("Saved info")
 
-with left:
-    st.markdown("### Edit")
-    edit_label = st.text_input("Label", value=item["label"], key="edit_label")
-    edit_login = st.text_input("Login ID", value=item["login_id"], key="edit_login")
+c1, c2 = st.columns([1, 1])
+with c1:
+    st.markdown("**Label**")
+    st.code(item["label"], language="text")
+    st.markdown("**Login ID / Username**")
+    st.code(item["login_id"], language="text")
 
-    if st.session_state.show_secret:
-        edit_secret = st.text_area("Password / Notes", value=item["secret_note"], height=160, key="edit_secret")
+with c2:
+    st.markdown("**Password / Notes**")
+    if st.session_state.get("show_secret", False):
+        st.code(item["secret_note"], language="text")
     else:
-        st.text_area("Password / Notes (hidden)", value="•" * 12, height=80, disabled=True)
-        edit_secret_new = st.text_area("New Password / Notes (optional)", value="", height=120, key="edit_secret_new")
-        edit_secret = item["secret_note"] if not edit_secret_new.strip() else edit_secret_new
+        st.code("••••••••••", language="text")
+        st.caption("Toggle “Show password/notes” in the sidebar to reveal.")
 
-    b1, b2 = st.columns([1, 1])
-    with b1:
-        if st.button("Update", type="primary", use_container_width=True):
-            update_item(item_id, edit_label, edit_login, edit_secret)
-            st.success("Updated.")
-            st.rerun()
+st.caption(f"Created: {item['created_at']} • Updated: {item['updated_at']}")
 
-    with b2:
-        confirm = st.checkbox("Confirm delete", key="confirm_delete_vault")
-        if st.button("Delete", use_container_width=True, disabled=not confirm):
-            delete_item(item_id)
-            st.success("Deleted.")
-            st.session_state.selected_vault_id = None
-            st.rerun()
-
-with right:
-    st.markdown("### Info")
-    st.write(f"**Created:** {item['created_at']}")
-    st.write(f"**Updated:** {item['updated_at']}")
-    st.caption("PIN lock stops casual access. Data is stored as plain text in SQLite.")
+# Delete (optional)
+st.divider()
+colA, colB = st.columns([1, 3])
+with colA:
+    confirm = st.checkbox("Confirm delete")
+with colB:
+    if st.button("Delete this entry", disabled=not confirm):
+        delete_item(item_id)
+        st.success("Deleted.")
+        st.session_state["selected_vault_id"] = None
+        st.rerun()
