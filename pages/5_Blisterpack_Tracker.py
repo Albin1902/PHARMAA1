@@ -1,7 +1,8 @@
 import os
 import sqlite3
-from datetime import date, datetime, timedelta, timezone
 import calendar
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 
 import pandas as pd
@@ -11,17 +12,19 @@ from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
 
 # -----------------------------
 # Page config
 # -----------------------------
 st.set_page_config(page_title="Blister Pack Tracker", layout="wide")
-st.title("Blister Pack Calendar + Delivery Tracker")
-st.caption("Use initials/ticket # instead of PHI if this app is public/shared.")
+st.title("Blister Pack Schedule + Delivery Tracker")
+st.caption("Use patient codes (initials/ticket#). Do NOT enter PHI if this app is public.")
+
 
 # -----------------------------
-# SQLite setup (reuse same DB file as your other pages)
+# DB setup (re-use your existing db file)
 # -----------------------------
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "waiters.db")
@@ -32,199 +35,349 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+def utc_iso():
+    return datetime.now(timezone.utc).isoformat()
+
 def init_db():
     with get_conn() as conn:
+        # schedule = “who belongs where”
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS bp_clients (
+            CREATE TABLE IF NOT EXISTS bp_schedule (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_code TEXT NOT NULL,            -- initials / ticket #
-                rotation_type TEXT NOT NULL,           -- weekly | biweekly | monthly
-                rotation_group TEXT NOT NULL,          -- R1 | R2 | R3
-                next_due DATE NOT NULL,
-                last_done DATE,
+                patient_code TEXT NOT NULL,
+                cadence TEXT NOT NULL,         -- weekly | biweekly | monthly
+                rotation TEXT NOT NULL,        -- R1 | R2 | R3
+
+                day_of_week INTEGER NOT NULL,  -- 0=Mon ... 6=Sun
+                week_slot TEXT NOT NULL,       -- W1/W2/W3/W4 or 'NA' for weekly
+
+                pkgs INTEGER NOT NULL DEFAULT 0,
                 notes TEXT,
-                needs_order INTEGER NOT NULL DEFAULT 0,
+
+                active INTEGER NOT NULL DEFAULT 1,
+
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_bp_next_due ON bp_clients(next_due)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_bp_rot ON bp_clients(rotation_type, rotation_group)")
+
+        # log = “for this due date, was it delivered/picked up?”
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bp_delivery_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL,
+                due_date TEXT NOT NULL,          -- YYYY-MM-DD
+                status TEXT NOT NULL,            -- pending | done
+                note TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(schedule_id, due_date),
+                FOREIGN KEY(schedule_id) REFERENCES bp_schedule(id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bp_sched_active ON bp_schedule(active)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bp_sched_day ON bp_schedule(day_of_week)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bp_log_due ON bp_delivery_log(due_date)")
         conn.commit()
 
 init_db()
 
-def utc_iso():
-    return datetime.now(timezone.utc).isoformat()
 
 # -----------------------------
-# Date helpers
+# Helpers
 # -----------------------------
-def add_months(d: date, months: int) -> date:
-    y = d.year + (d.month - 1 + months) // 12
-    m = (d.month - 1 + months) % 12 + 1
-    last_day = calendar.monthrange(y, m)[1]
-    return date(y, m, min(d.day, last_day))
-
-def advance_due(d: date, rotation_type: str) -> date:
-    if rotation_type == "weekly":
-        return d + timedelta(days=7)
-    if rotation_type == "biweekly":
-        return d + timedelta(days=14)
-    return add_months(d, 1)
-
-def days_until(d: date) -> int:
-    return (d - date.today()).days
+DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+WEEKSLOTS = ["W1","W2","W3","W4"]
+ROTATIONS = ["R1","R2","R3"]
+CADENCES = ["weekly","biweekly","monthly"]
 
 def start_of_week(d: date) -> date:
-    # Monday start
-    return d - timedelta(days=d.weekday())
+    return d - timedelta(days=d.weekday())  # Monday
+
+def week_slot_for_date(d: date) -> str:
+    # week-of-month slot based on day 1..7=W1, 8..14=W2, 15..21=W3, 22..=W4
+    return f"W{min(4, ((d.day - 1) // 7) + 1)}"
+
+def month_range(d: date):
+    first = date(d.year, d.month, 1)
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    last = date(d.year, d.month, last_day)
+    return first, last
+
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except:
+        return default
+
 
 # -----------------------------
-# DB operations
+# DB ops
 # -----------------------------
-def fetch_clients():
+def fetch_schedule(active_only=True):
     with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, patient_code, rotation_type, rotation_group, next_due, last_done,
-                   notes, needs_order, created_at, updated_at
-            FROM bp_clients
-            ORDER BY next_due ASC
-            """
-        ).fetchall()
-    out = []
-    for r in rows:
-        rr = dict(r)
-        rr["next_due"] = date.fromisoformat(rr["next_due"])
-        rr["last_done"] = date.fromisoformat(rr["last_done"]) if rr["last_done"] else None
-        rr["needs_order"] = bool(rr["needs_order"])
-        out.append(rr)
-    return out
+        if active_only:
+            rows = conn.execute(
+                """
+                SELECT * FROM bp_schedule
+                WHERE active=1
+                ORDER BY cadence, week_slot, day_of_week, patient_code
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM bp_schedule
+                ORDER BY active DESC, cadence, week_slot, day_of_week, patient_code
+                """
+            ).fetchall()
+    return [dict(r) for r in rows]
 
-def add_client(patient_code: str, rotation_type: str, rotation_group: str, next_due: date, notes: str, needs_order: bool):
+def add_schedule(patient_code, cadence, rotation, day_of_week, week_slot, pkgs, notes):
     now = utc_iso()
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO bp_clients (patient_code, rotation_type, rotation_group, next_due, last_done, notes, needs_order, created_at, updated_at)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            INSERT INTO bp_schedule
+            (patient_code, cadence, rotation, day_of_week, week_slot, pkgs, notes, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
-            (patient_code.strip(), rotation_type, rotation_group, next_due.isoformat(), notes.strip(), int(needs_order), now, now),
+            (patient_code.strip(), cadence, rotation, int(day_of_week), week_slot, int(pkgs), (notes or "").strip(), now, now),
         )
         conn.commit()
 
-def update_client(client_id: int, patient_code: str, rotation_type: str, rotation_group: str, next_due: date, notes: str, needs_order: bool):
+def update_schedule(row_id, patient_code, cadence, rotation, day_of_week, week_slot, pkgs, notes, active):
     now = utc_iso()
     with get_conn() as conn:
         conn.execute(
             """
-            UPDATE bp_clients
-            SET patient_code=?, rotation_type=?, rotation_group=?, next_due=?, notes=?, needs_order=?, updated_at=?
+            UPDATE bp_schedule
+            SET patient_code=?, cadence=?, rotation=?, day_of_week=?, week_slot=?, pkgs=?, notes=?, active=?, updated_at=?
             WHERE id=?
             """,
-            (patient_code.strip(), rotation_type, rotation_group, next_due.isoformat(), notes.strip(), int(needs_order), now, client_id),
+            (patient_code.strip(), cadence, rotation, int(day_of_week), week_slot, int(pkgs), (notes or "").strip(), int(active), now, int(row_id)),
         )
         conn.commit()
 
-def mark_delivered(client_id: int):
-    today = date.today()
+def delete_schedule(row_id):
     with get_conn() as conn:
-        row = conn.execute("SELECT next_due, rotation_type FROM bp_clients WHERE id=?", (client_id,)).fetchone()
-        if not row:
-            return
-        next_due = date.fromisoformat(row["next_due"])
-        rotation_type = row["rotation_type"]
-        new_due = advance_due(next_due, rotation_type)
+        conn.execute("DELETE FROM bp_schedule WHERE id=?", (int(row_id),))
+        conn.execute("DELETE FROM bp_delivery_log WHERE schedule_id=?", (int(row_id),))
+        conn.commit()
 
+def get_log(schedule_id: int, due_date: date):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status, note FROM bp_delivery_log WHERE schedule_id=? AND due_date=?",
+            (int(schedule_id), due_date.isoformat())
+        ).fetchone()
+    if not row:
+        return {"status": "pending", "note": ""}
+    return {"status": row["status"], "note": row["note"] or ""}
+
+def set_log(schedule_id: int, due_date: date, status: str, note: str = ""):
+    now = utc_iso()
+    with get_conn() as conn:
         conn.execute(
             """
-            UPDATE bp_clients
-            SET last_done=?, next_due=?, updated_at=?
-            WHERE id=?
+            INSERT INTO bp_delivery_log (schedule_id, due_date, status, note, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(schedule_id, due_date)
+            DO UPDATE SET status=excluded.status, note=excluded.note, updated_at=excluded.updated_at
             """,
-            (today.isoformat(), new_due.isoformat(), utc_iso(), client_id),
+            (int(schedule_id), due_date.isoformat(), status, (note or "").strip(), now),
         )
         conn.commit()
 
-def reschedule(client_id: int, new_due: date):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE bp_clients SET next_due=?, updated_at=? WHERE id=?",
-            (new_due.isoformat(), utc_iso(), client_id),
-        )
-        conn.commit()
-
-def delete_client(client_id: int):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM bp_clients WHERE id=?", (client_id,))
-        conn.commit()
 
 # -----------------------------
-# Build maps for calendar display
+# Occurrence builder (this is the “current week sheet” logic)
 # -----------------------------
-def month_due_map(clients, year: int, month: int):
-    mp = {}  # day -> list[str]
-    for c in clients:
-        d = c["next_due"]
-        if d.year == year and d.month == month:
-            tag = f"{c['patient_code']} ({c['rotation_group']})"
-            mp.setdefault(d.day, []).append(tag)
-    # sort entries per day
-    for k in mp:
-        mp[k] = sorted(mp[k])
-    return mp
+@dataclass
+class Occ:
+    schedule_id: int
+    due_date: date
+    patient_code: str
+    rotation: str
+    cadence: str
+    pkgs: int
+    sched_note: str
 
-def week_due_map(clients, week_start: date):
-    # week_start = Monday
-    mp = {week_start + timedelta(days=i): [] for i in range(7)}
-    for c in clients:
-        d = c["next_due"]
-        if week_start <= d <= (week_start + timedelta(days=6)):
-            mp[d].append(f"{c['patient_code']} ({c['rotation_group']})")
-    for k in mp:
-        mp[k] = sorted(mp[k])
-    return mp
+def build_week_occurrences(week_start: date, schedule_rows):
+    # Include:
+    # - all WEEKLY matching day
+    # - all BIWEEKLY+MONTHLY matching this week_slot + day
+    slot = week_slot_for_date(week_start)  # slot for the week (W1..W4)
+    occ = []
+    for r in schedule_rows:
+        dow = int(r["day_of_week"])
+        due = week_start + timedelta(days=dow)
+        if r["cadence"] == "weekly":
+            occ.append(Occ(r["id"], due, r["patient_code"], r["rotation"], r["cadence"], int(r["pkgs"]), r.get("notes","") or ""))
+        else:
+            if r["week_slot"] == slot:
+                occ.append(Occ(r["id"], due, r["patient_code"], r["rotation"], r["cadence"], int(r["pkgs"]), r.get("notes","") or ""))
+    # sort: day then rotation then patient
+    occ.sort(key=lambda x: (x.due_date, x.rotation, x.patient_code))
+    return occ
+
 
 # -----------------------------
-# PDF generation
+# PDF builders
 # -----------------------------
-def build_month_pdf(year: int, month: int, clients) -> bytes:
+def build_week_pdf(week_start: date, occs: list[Occ]) -> bytes:
     styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle(
+        "cell",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=9,
+        leading=10,
+        spaceAfter=0,
+        spaceBefore=0,
+    )
+
     buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(letter), leftMargin=0.4*inch, rightMargin=0.4*inch, topMargin=0.4*inch, bottomMargin=0.4*inch)
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=letter,  # portrait like your Excel print
+        leftMargin=0.55*inch,
+        rightMargin=0.55*inch,
+        topMargin=0.55*inch,
+        bottomMargin=0.55*inch,
+    )
 
-    title = f"Blister Pack Schedule — {calendar.month_name[month]} {year}"
-    story = [Paragraph(title, styles["Title"]), Spacer(1, 0.15*inch)]
+    week_end = week_start + timedelta(days=6)
+    title = f"Blister Pack — Weekly Sheet ({week_start.isoformat()} to {week_end.isoformat()})"
+    story = [Paragraph(title, styles["Title"]), Spacer(1, 0.12*inch)]
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
-    story.append(Spacer(1, 0.2*inch))
+    story.append(Spacer(1, 0.18*inch))
 
-    mp = month_due_map(clients, year, month)
+    # group by day
+    by_day = {}
+    for o in occs:
+        by_day.setdefault(o.due_date, []).append(o)
+
+    # Table like: Day | Patient (Rotation) | Pkgs | D/P/U | Notes
+    data = [[
+        Paragraph("<b>Day</b>", cell_style),
+        Paragraph("<b>Patient</b>", cell_style),
+        Paragraph("<b>Pkgs</b>", cell_style),
+        Paragraph("<b>D/P/U</b>", cell_style),
+        Paragraph("<b>Notes</b>", cell_style),
+    ]]
+
+    # dynamic heights: more rows if many patients/day
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        day_label = d.strftime("%a %Y-%m-%d")
+
+        items = by_day.get(d, [])
+        if not items:
+            data.append([Paragraph(day_label, cell_style), "", "", "☐", ""])
+            continue
+
+        # first row carries the day label, following rows blank day label
+        for idx, o in enumerate(items):
+            label = day_label if idx == 0 else ""
+            patient_txt = f"{o.patient_code} ({o.rotation})"
+            data.append([
+                Paragraph(label, cell_style),
+                Paragraph(patient_txt, cell_style),
+                Paragraph(str(o.pkgs) if o.pkgs else "", cell_style),
+                Paragraph("☐", cell_style),
+                Paragraph(o.sched_note or "", cell_style),
+            ])
+
+    tbl = Table(
+        data,
+        colWidths=[1.5*inch, 2.4*inch, 0.6*inch, 0.6*inch, 2.0*inch],
+    )
+    tbl.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#222222")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+
+    story.append(tbl)
+    doc.build(story)
+    return buf.getvalue()
+
+
+def build_month_calendar_pdf(year: int, month: int, occs_for_month: dict[int, list[str]]) -> bytes:
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle(
+        "cell",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7,
+        leading=8,
+        spaceAfter=0,
+        spaceBefore=0,
+    )
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(letter),
+        leftMargin=0.35*inch,
+        rightMargin=0.35*inch,
+        topMargin=0.35*inch,
+        bottomMargin=0.35*inch,
+    )
+
+    title = f"Blister Pack — Calendar ({calendar.month_name[month]} {year})"
+    story = [Paragraph(title, styles["Title"]), Spacer(1, 0.12*inch)]
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 0.15*inch))
+
     cal = calendar.monthcalendar(year, month)
 
-    # header row
-    data = [["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]]
+    def make_cell(day: int):
+        if day == 0:
+            return Paragraph("", cell_style), 1
+
+        items = occs_for_month.get(day, [])
+        max_names = 10  # your request
+        shown = items[:max_names]
+        extra = len(items) - len(shown)
+
+        lines = [f"<b>{day}</b>"] + [x.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") for x in shown]
+        if extra > 0:
+            lines.append(f"(+{extra} more)")
+        html = "<br/>".join(lines)
+        line_count = 1 + len(shown) + (1 if extra > 0 else 0)
+        return Paragraph(html, cell_style), line_count
+
+    data = [[Paragraph(x, styles["Heading4"]) for x in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]]]
+
+    row_heights = [0.35*inch]
+    base_padding = 0.18*inch
 
     for week in cal:
         row = []
+        week_max_lines = 1
         for day in week:
-            if day == 0:
-                row.append("")
-            else:
-                items = mp.get(day, [])
-                # limit shown lines to keep printable; overflow indicates more
-                max_lines = 5
-                shown = items[:max_lines]
-                extra = len(items) - len(shown)
-                cell = f"{day}\n" + ("\n".join(shown) if shown else "")
-                if extra > 0:
-                    cell += f"\n(+{extra} more)"
-                row.append(cell.strip())
+            cell, nlines = make_cell(day)
+            row.append(cell)
+            week_max_lines = max(week_max_lines, nlines)
         data.append(row)
+        row_heights.append(base_padding + week_max_lines * 0.14 * inch)
 
-    tbl = Table(data, colWidths=[(10.5*inch)/7]*7, rowHeights=[0.45*inch] + [1.1*inch]*len(cal))
+    tbl = Table(
+        data,
+        colWidths=[(10.7*inch)/7]*7,
+        rowHeights=row_heights
+    )
     tbl.setStyle(TableStyle([
         ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#222222")),
@@ -232,221 +385,236 @@ def build_month_pdf(year: int, month: int, clients) -> bytes:
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
         ("ALIGN", (0,0), (-1,0), "CENTER"),
         ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("FONTSIZE", (0,1), (-1,-1), 9),
-        ("LEFTPADDING", (0,1), (-1,-1), 6),
-        ("RIGHTPADDING", (0,1), (-1,-1), 6),
-        ("TOPPADDING", (0,1), (-1,-1), 6),
-        ("BOTTOMPADDING", (0,1), (-1,-1), 6),
+        ("LEFTPADDING", (0,1), (-1,-1), 5),
+        ("RIGHTPADDING", (0,1), (-1,-1), 5),
+        ("TOPPADDING", (0,1), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,1), (-1,-1), 4),
     ]))
 
     story.append(tbl)
     doc.build(story)
     return buf.getvalue()
 
-def build_week_pdf(week_start: date, clients) -> bytes:
-    styles = getSampleStyleSheet()
-    buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=0.6*inch, rightMargin=0.6*inch, topMargin=0.6*inch, bottomMargin=0.6*inch)
-
-    week_end = week_start + timedelta(days=6)
-    title = f"Blister Pack — Weekly Sheet ({week_start.isoformat()} to {week_end.isoformat()})"
-    story = [Paragraph(title, styles["Title"]), Spacer(1, 0.15*inch)]
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
-    story.append(Spacer(1, 0.2*inch))
-
-    mp = week_due_map(clients, week_start)
-
-    data = [["Day", "Due (Patient / Rotation)"]]
-    for i in range(7):
-        d = week_start + timedelta(days=i)
-        day_name = d.strftime("%a %Y-%m-%d")
-        items = mp[d]
-        cell = "\n".join(items) if items else ""
-        data.append([day_name, cell])
-
-    tbl = Table(data, colWidths=[2.2*inch, 4.9*inch])
-    tbl.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#222222")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("FONTSIZE", (0,1), (-1,-1), 10),
-        ("LEFTPADDING", (0,1), (-1,-1), 6),
-        ("RIGHTPADDING", (0,1), (-1,-1), 6),
-        ("TOPPADDING", (0,1), (-1,-1), 6),
-        ("BOTTOMPADDING", (0,1), (-1,-1), 6),
-    ]))
-
-    story.append(tbl)
-    doc.build(story)
-    return buf.getvalue()
 
 # -----------------------------
-# Sidebar: Add / Edit client
+# Sidebar: Add/Edit schedule entries
 # -----------------------------
 with st.sidebar:
-    st.header("Add / Edit Blister Pack")
-    mode = st.radio("Mode", ["Add new", "Edit existing"], horizontal=True)
+    st.header("Add / Edit BP Schedule")
 
-    clients = fetch_clients()
-    client_by_id = {c["id"]: c for c in clients}
+    mode = st.radio("Mode", ["Add", "Edit"], horizontal=True)
+    all_rows = fetch_schedule(active_only=False)
 
-    if mode == "Edit existing" and clients:
-        pick = st.selectbox(
-            "Select",
-            options=[c["id"] for c in clients],
-            format_func=lambda cid: f"{client_by_id[cid]['patient_code']} • {client_by_id[cid]['rotation_type']} {client_by_id[cid]['rotation_group']} (#{cid})"
-        )
-        cur = client_by_id[pick]
-        patient_code = st.text_input("Patient code", value=cur["patient_code"])
-        rotation_type = st.selectbox("Rotation type", ["weekly", "biweekly", "monthly"],
-                                     index=["weekly","biweekly","monthly"].index(cur["rotation_type"]))
-        rotation_group = st.selectbox("Rotation group", ["R1", "R2", "R3"],
-                                      index=["R1","R2","R3"].index(cur["rotation_group"]))
-        next_due = st.date_input("Next due date", value=cur["next_due"])
-        needs_order = st.checkbox("Needs ordering", value=cur["needs_order"])
-        notes = st.text_area("Notes", value=cur.get("notes","") or "", height=90)
+    if mode == "Add":
+        patient_code = st.text_input("Patient code (NO names)", placeholder="e.g., AB-42")
+        cadence = st.selectbox("Cadence", CADENCES, index=0)
+        rotation = st.selectbox("Rotation", ROTATIONS, index=0)
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("Save changes", type="primary", use_container_width=True):
-                update_client(pick, patient_code, rotation_type, rotation_group, next_due, notes, needs_order)
-                st.success("Updated.")
-                st.rerun()
-        with c2:
-            if st.button("Mark delivered", use_container_width=True):
-                mark_delivered(pick)
-                st.success("Delivered + advanced next due.")
-                st.rerun()
-        with c3:
-            confirm = st.checkbox("Confirm delete", key="bp_del_confirm")
-            if st.button("Delete", disabled=not confirm, use_container_width=True):
-                delete_client(pick)
-                st.success("Deleted.")
-                st.rerun()
+        day_of_week = st.selectbox("Day", list(range(7)), format_func=lambda i: DAYS[i], index=1)
 
-        st.divider()
-        st.caption("Reschedule quickly")
-        new_due = st.date_input("Reschedule to", value=cur["next_due"], key="bp_resched")
-        if st.button("Apply reschedule", use_container_width=True):
-            reschedule(pick, new_due)
-            st.success("Rescheduled.")
-            st.rerun()
+        # weekly -> week_slot NA
+        if cadence == "weekly":
+            week_slot = "NA"
+            st.info("Weekly schedule ignores W1–W4.")
+        else:
+            week_slot = st.selectbox("Week slot (W1–W4)", WEEKSLOTS, index=2)
 
-    else:
-        patient_code = st.text_input("Patient code (initials/ticket #)", placeholder="e.g., AB-12")
-        rotation_type = st.selectbox("Rotation type", ["weekly", "biweekly", "monthly"])
-        rotation_group = st.selectbox("Rotation group", ["R1", "R2", "R3"])
-        next_due = st.date_input("First/Next due date", value=date.today())
-        needs_order = st.checkbox("Needs ordering", value=False)
-        notes = st.text_area("Notes (optional)", height=90)
+        pkgs = st.number_input("Pkgs (optional)", min_value=0, value=0, step=1)
+        notes = st.text_area("Notes (optional)", height=80)
 
         if st.button("Add schedule", type="primary", use_container_width=True):
             if not patient_code.strip():
-                st.error("Patient code is required.")
+                st.error("Patient code required.")
             else:
-                add_client(patient_code, rotation_type, rotation_group, next_due, notes, needs_order)
+                add_schedule(patient_code, cadence, rotation, day_of_week, week_slot, pkgs, notes)
                 st.success("Added.")
                 st.rerun()
 
-# -----------------------------
-# Main views
-# -----------------------------
-clients = fetch_clients()
-
-tab_upcoming, tab_calendar, tab_print = st.tabs(["Upcoming", "Calendar", "Print PDFs"])
-
-# Upcoming dataframe
-rows = []
-for c in clients:
-    rows.append({
-        "ID": c["id"],
-        "Patient": c["patient_code"],
-        "Rotation": f"{c['rotation_type']} {c['rotation_group']}",
-        "Next due": c["next_due"].isoformat(),
-        "Days until": days_until(c["next_due"]),
-        "Needs order": "YES" if c["needs_order"] else "",
-        "Last done": c["last_done"].isoformat() if c["last_done"] else "",
-        "Notes": (c.get("notes","") or ""),
-    })
-df = pd.DataFrame(rows)
-
-with tab_upcoming:
-    st.subheader("Upcoming deliveries / pickups")
-    if df.empty:
-        st.info("No schedules yet. Add some from the sidebar.")
     else:
-        horizon = st.selectbox("Show horizon", [7, 14, 30, 60], index=2)
-        view = df.copy()
-        view["Days until"] = view["Days until"].astype(int)
-        view = view[view["Days until"] <= horizon].sort_values(["Days until", "Next due"])
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        if not all_rows:
+            st.info("No schedules yet.")
+        else:
+            pick = st.selectbox(
+                "Select schedule",
+                options=[r["id"] for r in all_rows],
+                format_func=lambda rid: (
+                    f"{next(x for x in all_rows if x['id']==rid)['patient_code']} • "
+                    f"{next(x for x in all_rows if x['id']==rid)['cadence']} • "
+                    f"{next(x for x in all_rows if x['id']==rid)['rotation']} • "
+                    f"{DAYS[int(next(x for x in all_rows if x['id']==rid)['day_of_week'])]} • "
+                    f"{next(x for x in all_rows if x['id']==rid)['week_slot']}"
+                )
+            )
+            cur = next(r for r in all_rows if r["id"] == pick)
 
-with tab_calendar:
-    st.subheader("Calendar view (NEXT due only)")
-    if df.empty:
-        st.info("No schedules yet.")
+            patient_code = st.text_input("Patient code", value=cur["patient_code"])
+            cadence = st.selectbox("Cadence", CADENCES, index=CADENCES.index(cur["cadence"]))
+            rotation = st.selectbox("Rotation", ROTATIONS, index=ROTATIONS.index(cur["rotation"]))
+            day_of_week = st.selectbox("Day", list(range(7)), format_func=lambda i: DAYS[i], index=int(cur["day_of_week"]))
+
+            if cadence == "weekly":
+                week_slot = "NA"
+                st.info("Weekly schedule ignores W1–W4.")
+            else:
+                ws = cur["week_slot"] if cur["week_slot"] in WEEKSLOTS else "W1"
+                week_slot = st.selectbox("Week slot (W1–W4)", WEEKSLOTS, index=WEEKSLOTS.index(ws))
+
+            pkgs = st.number_input("Pkgs", min_value=0, value=safe_int(cur["pkgs"], 0), step=1)
+            notes = st.text_area("Notes", value=cur.get("notes","") or "", height=80)
+            active = st.checkbox("Active", value=bool(cur["active"]))
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("Save changes", type="primary", use_container_width=True):
+                    update_schedule(pick, patient_code, cadence, rotation, day_of_week, week_slot, pkgs, notes, active)
+                    st.success("Saved.")
+                    st.rerun()
+            with c2:
+                confirm = st.checkbox("Confirm delete", key="bp_confirm_del")
+                if st.button("Delete", disabled=not confirm, use_container_width=True):
+                    delete_schedule(pick)
+                    st.success("Deleted.")
+                    st.rerun()
+            with c3:
+                st.caption("Tip: Keep weekly on Tue/Wed/Thu like your sheet.")
+
+
+# -----------------------------
+# Main: views + print
+# -----------------------------
+schedule_active = fetch_schedule(active_only=True)
+
+today = date.today()
+week_start = start_of_week(today)
+week_end = week_start + timedelta(days=6)
+slot = week_slot_for_date(week_start)
+
+tab_week, tab_month, tab_print = st.tabs(["This Week (Tracker)", "Month View", "Print PDFs"])
+
+
+with tab_week:
+    st.subheader(f"Current Week: {week_start.isoformat()} → {week_end.isoformat()}  |  Slot: {slot}")
+
+    occs = build_week_occurrences(week_start, schedule_active)
+
+    if not occs:
+        st.info("No schedules match this week. Add schedules from the sidebar.")
     else:
-        today = date.today()
-        year = today.year
-        month = today.month
+        # Group by day and render like a sheet
+        for i in range(7):
+            d = week_start + timedelta(days=i)
+            day_occs = [o for o in occs if o.due_date == d]
 
-        mp = month_due_map(clients, year, month)
-        cal = calendar.monthcalendar(year, month)
+            st.markdown(f"### {DAYS[i]} — {d.isoformat()}")
+            if not day_occs:
+                st.caption("No deliveries.")
+                st.divider()
+                continue
 
-        grid = []
-        for week in cal:
-            row = []
-            for day in week:
-                if day == 0:
-                    row.append("")
-                else:
-                    items = mp.get(day, [])
-                    cell = str(day)
-                    if items:
-                        cell += "\n" + "\n".join(items[:6])
-                        if len(items) > 6:
-                            cell += f"\n(+{len(items)-6} more)"
-                    row.append(cell)
-            grid.append(row)
+            # Sheet table: Patient | Pkgs | Done | Notes
+            for o in day_occs:
+                log = get_log(o.schedule_id, o.due_date)
+                done = (log["status"] == "done")
 
-        cal_df = pd.DataFrame(grid, columns=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"])
-        st.dataframe(cal_df, use_container_width=True, hide_index=True)
-        st.caption("After you mark delivered, the next due advances automatically.")
+                c1, c2, c3, c4, c5 = st.columns([2.2, 0.6, 0.8, 2.6, 0.9])
+                with c1:
+                    st.write(f"**{o.patient_code} ({o.rotation})**  ·  {o.cadence}")
+                    if o.sched_note:
+                        st.caption(o.sched_note)
+                with c2:
+                    st.write(str(o.pkgs) if o.pkgs else "")
+                with c3:
+                    new_done = st.checkbox("Done", value=done, key=f"done_{o.schedule_id}_{o.due_date.isoformat()}")
+                with c4:
+                    note_val = st.text_input("Note", value=log["note"], key=f"note_{o.schedule_id}_{o.due_date.isoformat()}", label_visibility="collapsed")
+                with c5:
+                    if st.button("Save", key=f"save_{o.schedule_id}_{o.due_date.isoformat()}"):
+                        set_log(o.schedule_id, o.due_date, "done" if new_done else "pending", note_val)
+                        st.rerun()
+
+            st.divider()
+
+
+with tab_month:
+    st.subheader("Current Month (NEXT occurrences)")
+    y, m = today.year, today.month
+    first, last = month_range(today)
+
+    # Build occurrences map for month calendar:
+    # For each week in the month, generate occurrences and add to day bucket.
+    occs_by_day = {}  # day(int) -> list[str]
+
+    # Iterate weeks covering the month
+    cur = start_of_week(first)
+    while cur <= last:
+        occs = build_week_occurrences(cur, schedule_active)
+        for o in occs:
+            if o.due_date.month == m and o.due_date.year == y:
+                txt = f"{o.patient_code} ({o.rotation})"
+                occs_by_day.setdefault(o.due_date.day, []).append(txt)
+        cur = cur + timedelta(days=7)
+
+    for k in occs_by_day:
+        occs_by_day[k] = sorted(occs_by_day[k])
+
+    # show a simple grid in-app (not the PDF)
+    cal = calendar.monthcalendar(y, m)
+    grid = []
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append("")
+            else:
+                items = occs_by_day.get(day, [])
+                cell = str(day)
+                if items:
+                    cell += "\n" + "\n".join(items[:8])
+                    if len(items) > 8:
+                        cell += f"\n(+{len(items)-8} more)"
+                row.append(cell)
+        grid.append(row)
+
+    cal_df = pd.DataFrame(grid, columns=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"])
+    st.dataframe(cal_df, use_container_width=True, hide_index=True)
+    st.caption("PDF export fits ~10 items per cell and expands row height for crowded weeks.")
+
 
 with tab_print:
-    st.subheader("Print-ready PDFs")
-    if not clients:
+    st.subheader("Print PDFs")
+    if not schedule_active:
         st.info("Add schedules first.")
     else:
-        today = date.today()
-        year = today.year
-        month = today.month
-        wk_start = start_of_week(today)
+        # Build week occurrences for PDF
+        occs_week = build_week_occurrences(week_start, schedule_active)
+
+        # Build month occurrence map for PDF calendar
+        y, m = today.year, today.month
+        first, last = month_range(today)
+        occs_by_day = {}
+        cur = start_of_week(first)
+        while cur <= last:
+            occs = build_week_occurrences(cur, schedule_active)
+            for o in occs:
+                if o.due_date.month == m and o.due_date.year == y:
+                    occs_by_day.setdefault(o.due_date.day, []).append(f"{o.patient_code} ({o.rotation})")
+            cur = cur + timedelta(days=7)
+        for k in occs_by_day:
+            occs_by_day[k] = sorted(occs_by_day[k])
 
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### Current Month")
-            month_pdf = build_month_pdf(year, month, clients)
+            st.markdown("### Weekly Sheet (like your Excel print)")
+            week_pdf = build_week_pdf(week_start, occs_week)
             st.download_button(
-                label=f"Download {calendar.month_name[month]} {year} (PDF)",
-                data=month_pdf,
-                file_name=f"blisterpack_{year}_{month:02d}.pdf",
+                "Download Weekly PDF",
+                data=week_pdf,
+                file_name=f"bp_week_{week_start.isoformat()}.pdf",
                 mime="application/pdf",
                 use_container_width=True,
             )
-            st.caption("Open the PDF → Print.")
 
         with col2:
-            st.markdown("### Current Week")
-            week_pdf = build_week_pdf(wk_start, clients)
-            st.download_button(
-                label=f"Download Week of {wk_start.isoformat()} (PDF)",
-                data=week_pdf,
-                file_name=f"blisterpack_week_{wk_start.isoformat()}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-            st.caption("Weekly sheet is a list by day (Mon–Sun).")
+            st.markdown("### Month Calendar (auto-fits ~10 names/cell)")
+            month_pdf = build_month_calendar_pdf(y, m,
