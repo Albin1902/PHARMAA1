@@ -3,3 +3,5 @@ pandas
 pillow
 pytesseract
 streamlit-autorefresh
+reportlab
+pandas
