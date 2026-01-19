@@ -1,3 +1,5 @@
 tesseract-ocr
 libtesseract-dev
 tesseract-ocr-fra
+reportlab
+pandas
