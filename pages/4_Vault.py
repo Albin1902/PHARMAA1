@@ -195,11 +195,8 @@ with c1:
 
 with c2:
     st.markdown("**Password / Notes**")
-    if st.session_state.get("show_secret", False):
-        st.code(item["secret_note"], language="text")
-    else:
-        st.code("••••••••••", language="text")
-        st.caption("Toggle “Show password/notes” in the sidebar to reveal.")
+    st.code(item["secret_note"], language="text")
+
 
 st.caption(f"Created: {item['created_at']} • Updated: {item['updated_at']}")
 
