@@ -1,3 +1,5 @@
+# pages/4_Vault.py
+
 import os
 import sqlite3
 import hashlib
@@ -57,26 +59,33 @@ if "vault_unlocked" not in st.session_state:
 with st.sidebar:
     st.header("Vault Lock")
 
-    # You set this in secrets
     if "VAULT_PIN" not in st.secrets:
         st.error("Missing VAULT_PIN in Streamlit secrets.")
         st.stop()
 
     correct_pin_hash = sha256(str(st.secrets["VAULT_PIN"]).strip())
 
-    pin = st.text_input("Enter PIN", type="password", placeholder="PIN")
-    if st.button("Unlock", use_container_width=True):
-        if sha256(pin.strip()) == correct_pin_hash:
-            st.session_state.vault_unlocked = True
-            st.success("Unlocked.")
-        else:
-            st.session_state.vault_unlocked = False
-            st.error("Wrong PIN.")
+    pin = st.text_input("Enter PIN", type="password", placeholder="PIN", key="vault_pin_entry")
+    colu1, colu2 = st.columns(2)
+    with colu1:
+        if st.button("Unlock", use_container_width=True):
+            if sha256(pin.strip()) == correct_pin_hash:
+                st.session_state.vault_unlocked = True
+                st.success("Unlocked.")
+                st.rerun()
+            else:
+                st.session_state.vault_unlocked = False
+                st.error("Wrong PIN.")
 
-    if st.session_state.vault_unlocked:
-        if st.button("Lock", use_container_width=True):
-            st.session_state.vault_unlocked = False
-            st.info("Locked.")
+    with colu2:
+        if st.session_state.vault_unlocked:
+            if st.button("Lock", use_container_width=True):
+                st.session_state.vault_unlocked = False
+                st.info("Locked.")
+                st.rerun()
+
+    st.divider()
+    st.session_state.show_secret = st.toggle("Show saved secret", value=st.session_state.get("show_secret", False))
 
 if not st.session_state.vault_unlocked:
     st.info("Vault is locked. Enter PIN in the sidebar to unlock.")
@@ -96,10 +105,10 @@ def fetch_all():
         ).fetchall()
     return [dict(r) for r in rows]
 
-def add_item(label: str, login_id: str, secret_note: str):
+def add_item(label: str, login_id: str, secret_note: str) -> int:
     now = utc_iso()
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO vault_notes (label, login_id, secret_note, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -107,6 +116,7 @@ def add_item(label: str, login_id: str, secret_note: str):
             (label.strip(), login_id.strip(), secret_note.strip(), now, now),
         )
         conn.commit()
+        return int(cur.lastrowid)
 
 def update_item(item_id: int, label: str, login_id: str, secret_note: str):
     now = utc_iso()
@@ -127,38 +137,45 @@ def delete_item(item_id: int):
         conn.commit()
 
 # -----------------------------
-# Add new
+# Add new entry
 # -----------------------------
 st.subheader("Add new entry")
 
-c1, c2 = st.columns([1, 1])
+c1, c2 = st.columns([1.15, 1])
 with c1:
-    new_label = st.text_input("Label (where is this used?)", placeholder="e.g., Canada Life portal")
-    new_login = st.text_input("Login ID / Username", placeholder="email / username")
+    new_label = st.text_input("Label (where is this used?)", placeholder="e.g., Canada Life portal", key="new_label")
+    new_login = st.text_input("Login ID / Username", placeholder="email / username", key="new_login")
 with c2:
-    new_secret = st.text_area("Password / Notes (stored as text)", height=110, placeholder="Password, security answer, notes...")
+    new_secret = st.text_area("Password / Notes", height=110, placeholder="Password, security answer, notes...", key="new_secret")
 
 if st.button("Save", type="primary"):
     if not new_label.strip() or not new_login.strip() or not new_secret.strip():
-        st.error("Need Label + Login ID + Notes.")
+        st.error("Need Label + Login ID + Password/Notes.")
     else:
-        add_item(new_label, new_login, new_secret)
+        new_id = add_item(new_label, new_login, new_secret)
+
+        # Auto-select the newly saved entry
+        st.session_state["selected_vault_id"] = new_id
+
+        # Clear inputs for next save
+        st.session_state["new_label"] = ""
+        st.session_state["new_login"] = ""
+        st.session_state["new_secret"] = ""
+
         st.success("Saved.")
         st.rerun()
 
 st.divider()
 
 # -----------------------------
-# List / edit
+# View/Edit
 # -----------------------------
 items = fetch_all()
-if not items:
-    st.info("No vault entries yet.")
-    st.stop()
 
 st.subheader("Saved entries")
 
-search = st.text_input("Search", placeholder="filter by label or login id").strip().lower()
+search = st.text_input("Search", placeholder="filter by label or login id", key="vault_search").strip().lower()
+
 filtered = items
 if search:
     filtered = [
@@ -166,35 +183,72 @@ if search:
         if search in (it["label"] + " " + it["login_id"]).lower()
     ]
 
-options = {f"{it['label']}  •  {it['login_id']}  (#{it['id']})": it["id"] for it in filtered}
-pick = st.selectbox("Select an entry", options=list(options.keys()))
-item_id = options[pick]
+if not filtered:
+    st.info("No entries match your search.")
+    st.stop()
+
+# Build options (stable)
+options = {f"{it['label']} / {it['login_id']}  (#{it['id']})": it["id"] for it in filtered}
+labels = list(options.keys())
+
+# Choose default selection:
+# - if we have selected_vault_id in session, use it if present in filtered
+# - else choose first item
+selected_id = st.session_state.get("selected_vault_id", None)
+default_index = 0
+if selected_id is not None:
+    # find the label that maps to selected_id
+    for i, lab in enumerate(labels):
+        if options[lab] == selected_id:
+            default_index = i
+            break
+
+picked_label = st.selectbox(
+    "Select an entry",
+    options=labels,
+    index=default_index,
+    key="vault_selectbox",
+)
+item_id = options[picked_label]
+st.session_state["selected_vault_id"] = item_id  # keep stable
+
 item = next(i for i in items if i["id"] == item_id)
 
 left, right = st.columns([1.2, 1])
 
 with left:
     st.markdown("### Edit")
-    label = st.text_input("Label", value=item["label"], key="e_label")
-    login_id = st.text_input("Login ID", value=item["login_id"], key="e_login")
-    secret_note = st.text_area("Password / Notes", value=item["secret_note"], height=160, key="e_secret")
+
+    edit_label = st.text_input("Label", value=item["label"], key="edit_label")
+    edit_login = st.text_input("Login ID", value=item["login_id"], key="edit_login")
+
+    if st.session_state.get("show_secret", False):
+        edit_secret = st.text_area("Password / Notes", value=item["secret_note"], height=160, key="edit_secret")
+    else:
+        # Show masked version, but still allow editing via separate box
+        st.text_area("Password / Notes (hidden)", value="•" * 12, height=80, disabled=True)
+        edit_secret = st.text_area("New Password / Notes (optional)", value="", height=120, key="edit_secret_new")
+        if not edit_secret.strip():
+            edit_secret = item["secret_note"]  # keep old if blank
 
     b1, b2 = st.columns([1, 1])
+
     with b1:
         if st.button("Update", type="primary", use_container_width=True):
-            update_item(item_id, label, login_id, secret_note)
+            update_item(item_id, edit_label, edit_login, edit_secret)
             st.success("Updated.")
             st.rerun()
 
     with b2:
-        confirm = st.checkbox("Confirm delete", key="confirm_del")
+        confirm = st.checkbox("Confirm delete", key="confirm_delete_vault")
         if st.button("Delete", use_container_width=True, disabled=not confirm):
             delete_item(item_id)
             st.success("Deleted.")
+            st.session_state["selected_vault_id"] = None
             st.rerun()
 
 with right:
     st.markdown("### Info")
     st.write(f"**Created:** {item['created_at']}")
     st.write(f"**Updated:** {item['updated_at']}")
-    st.caption("This vault is PIN-locked but entries are stored as plain text in SQLite. If you need real security, use encryption or a password manager.")
+    st.caption("PIN lock stops casual access. Data is still stored as plain text in SQLite.")
