@@ -330,9 +330,11 @@ def filter_schedule(schedule: dict[date, list[DeliveryItem]], mode: str) -> dict
 
     out: dict[date, list[DeliveryItem]] = {}
     for d, items in schedule.items():
-        out[d] = [it for it in items if it.interval_weeks in allowed]
-        out[d].sort(key=lambda x: (it.interval_weeks, it.name.lower()))
+        out[d] = [x for x in items if x.interval_weeks in allowed]
+        # ✅ FIX: use x (not it)
+        out[d].sort(key=lambda x: (x.interval_weeks, x.name.lower()))
     return out
+
 
 
 # =========================
