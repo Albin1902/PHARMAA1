@@ -14,15 +14,13 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # -----------------------------
-# Page config + light CSS (landscape feel)
+# Page config + light CSS
 # -----------------------------
 st.set_page_config(page_title="Blisterpack Tracker", layout="wide")
 st.markdown(
     """
     <style>
-    /* reduce vertical wasted space a bit */
     .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-    /* make dataframes look tighter */
     [data-testid="stDataFrame"] { border-radius: 10px; }
     </style>
     """,
@@ -55,7 +53,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 patient_code TEXT NOT NULL,
                 cadence TEXT NOT NULL,         -- weekly | biweekly | monthly
-                rotation TEXT NOT NULL,        -- R1 | R2 | R3 (your route/rotation)
+                rotation TEXT NOT NULL,        -- R1 | R2 | R3
                 day_of_week INTEGER NOT NULL,  -- 0=Mon ... 6=Sun
                 week_slot TEXT NOT NULL,       -- W1/W2/W3/W4 or 'NA'
                 pkgs INTEGER NOT NULL DEFAULT 0,
@@ -79,7 +77,6 @@ def init_db():
             )
             """
         )
-        # settings table for cycle anchor (fixes W1–W4 logic)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS bp_settings (
@@ -103,14 +100,21 @@ CADENCES = ["weekly","biweekly","monthly"]
 # -----------------------------
 # Date helpers
 # -----------------------------
-def start_of_week(d):
+def start_of_week(d: date) -> date:
     return d - timedelta(days=d.weekday())  # Monday
 
-def month_range(d):
+def month_range(d: date):
     first = date(d.year, d.month, 1)
     last_day = calendar.monthrange(d.year, d.month)[1]
     last = date(d.year, d.month, last_day)
     return first, last
+
+def add_months(d: date, delta: int) -> date:
+    # delta can be negative
+    y = d.year + (d.month - 1 + delta) // 12
+    m = (d.month - 1 + delta) % 12 + 1
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return date(y, m, day)
 
 # -----------------------------
 # Settings helpers (cycle anchor)
@@ -135,20 +139,17 @@ def set_setting(key, value):
         conn.commit()
 
 def get_anchor_monday():
-    # stored as YYYY-MM-DD (must be a Monday)
     raw = get_setting("cycle_anchor_monday", None)
     if raw:
         try:
             return date.fromisoformat(raw)
         except Exception:
             pass
-    # default: current week Monday (works immediately, but you SHOULD set it)
     d = start_of_week(date.today())
     set_setting("cycle_anchor_monday", d.isoformat())
     return d
 
-def cycle_week_slot(week_start, anchor_monday):
-    # anchor_monday MUST be a Monday
+def cycle_week_slot(week_start: date, anchor_monday: date) -> str:
     weeks = (week_start - anchor_monday).days // 7
     idx = (weeks % 4) + 1
     return f"W{idx}"
@@ -184,7 +185,8 @@ def add_schedule(patient_code, cadence, rotation, day_of_week, week_slot, pkgs, 
             (patient_code, cadence, rotation, day_of_week, week_slot, pkgs, notes, active, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
-            (patient_code.strip(), cadence, rotation, int(day_of_week), week_slot, int(pkgs), (notes or "").strip(), now, now),
+            (patient_code.strip(), cadence, rotation, int(day_of_week), week_slot, int(pkgs),
+             (notes or "").strip(), now, now),
         )
         conn.commit()
 
@@ -197,7 +199,8 @@ def update_schedule(row_id, patient_code, cadence, rotation, day_of_week, week_s
             SET patient_code=?, cadence=?, rotation=?, day_of_week=?, week_slot=?, pkgs=?, notes=?, active=?, updated_at=?
             WHERE id=?
             """,
-            (patient_code.strip(), cadence, rotation, int(day_of_week), week_slot, int(pkgs), (notes or "").strip(), int(active), now, int(row_id)),
+            (patient_code.strip(), cadence, rotation, int(day_of_week), week_slot, int(pkgs),
+             (notes or "").strip(), int(active), now, int(row_id)),
         )
         conn.commit()
 
@@ -232,7 +235,7 @@ def set_log(schedule_id, due_date, status, note=""):
         conn.commit()
 
 # -----------------------------
-# Occurrence builder (THIS WEEK)
+# Occurrence builder
 # -----------------------------
 def build_week_occurrences(week_start, schedule_rows, slot):
     occ = []
@@ -266,19 +269,14 @@ def build_week_occurrences(week_start, schedule_rows, slot):
 def build_week_pdf_landscape(week_start, occs, slot, anchor_monday):
     styles = getSampleStyleSheet()
     cell_style = ParagraphStyle(
-        "cell",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=10,
-        spaceAfter=0,
-        spaceBefore=0,
+        "cell", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=9, leading=10
     )
 
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf,
-        pagesize=landscape(letter),  # ✅ landscape weekly
+        pagesize=landscape(letter),
         leftMargin=0.5*inch,
         rightMargin=0.5*inch,
         topMargin=0.5*inch,
@@ -288,7 +286,7 @@ def build_week_pdf_landscape(week_start, occs, slot, anchor_monday):
     week_end = week_start + timedelta(days=6)
     title = f"Blister Pack — Weekly Sheet ({week_start.isoformat()} to {week_end.isoformat()})"
     story = [Paragraph(title, styles["Title"]), Spacer(1, 0.10*inch)]
-    story.append(Paragraph(f"Cycle slot: <b>{slot}</b>  |  Anchor Monday: {anchor_monday.isoformat()}", styles["Normal"]))
+    story.append(Paragraph(f"Cycle slot: <b>{slot}</b> | Anchor Monday: {anchor_monday.isoformat()}", styles["Normal"]))
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
     story.append(Spacer(1, 0.15*inch))
 
@@ -317,19 +315,17 @@ def build_week_pdf_landscape(week_start, occs, slot, anchor_monday):
         for idx, o in enumerate(items):
             label = day_label if idx == 0 else ""
             patient_txt = f"{o['patient_code']} ({o['rotation']})"
-            cadence_txt = o["cadence"]
             pkgs_txt = str(o["pkgs"]) if o["pkgs"] else ""
             note_txt = o["sched_note"] or ""
             data.append([
                 Paragraph(label, cell_style),
                 Paragraph(patient_txt, cell_style),
-                Paragraph(cadence_txt, cell_style),
+                Paragraph(o["cadence"], cell_style),
                 Paragraph(pkgs_txt, cell_style),
                 Paragraph("☐", cell_style),
                 Paragraph(note_txt, cell_style),
             ])
 
-    # Wider page, so we can make it readable.
     tbl = Table(
         data,
         colWidths=[1.55*inch, 3.2*inch, 1.1*inch, 0.7*inch, 0.7*inch, 4.2*inch],
@@ -350,16 +346,11 @@ def build_week_pdf_landscape(week_start, occs, slot, anchor_monday):
     doc.build(story)
     return buf.getvalue()
 
-def build_month_calendar_pdf(year, month, occs_for_month):
+def build_month_calendar_pdf(year, month, occs_for_month, title_suffix=""):
     styles = getSampleStyleSheet()
     cell_style = ParagraphStyle(
-        "cell",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7,
-        leading=8,
-        spaceAfter=0,
-        spaceBefore=0,
+        "cell", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=7, leading=8
     )
 
     buf = BytesIO()
@@ -373,6 +364,9 @@ def build_month_calendar_pdf(year, month, occs_for_month):
     )
 
     title = f"Blister Pack — Calendar ({calendar.month_name[month]} {year})"
+    if title_suffix:
+        title += f" {title_suffix}"
+
     story = [Paragraph(title, styles["Title"]), Spacer(1, 0.12*inch)]
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
     story.append(Spacer(1, 0.15*inch))
@@ -384,16 +378,16 @@ def build_month_calendar_pdf(year, month, occs_for_month):
             return Paragraph("", cell_style), 1
 
         items = occs_for_month.get(day, [])
-        max_names = 10  # ✅ accommodate ~10 per day
+        max_names = 10
         shown = items[:max_names]
         extra = len(items) - len(shown)
 
-        lines = ["<b>%d</b>" % day]
+        lines = [f"<b>{day}</b>"]
         for x in shown:
             x = x.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             lines.append(x)
         if extra > 0:
-            lines.append("(+%d more)" % extra)
+            lines.append(f"(+{extra} more)")
 
         html = "<br/>".join(lines)
         line_count = 1 + len(shown) + (1 if extra > 0 else 0)
@@ -450,7 +444,7 @@ with st.sidebar:
             st.success("Anchor saved. Reloading…")
             st.rerun()
 
-    st.caption("Tip: Set this once to match your pharmacy’s 4-week blister cycle.")
+    st.caption("Set this once to match your pharmacy’s 4-week blister cycle.")
 
     st.divider()
     st.subheader("Add / Edit BP Schedule")
@@ -468,7 +462,7 @@ with st.sidebar:
             week_slot = "NA"
             st.info("Weekly ignores W1–W4.")
         else:
-            week_slot = st.selectbox("Week slot (W1–W4)", WEEKSLOTS, index=2)
+            week_slot = st.selectbox("Week slot (W1–W4)", WEEKSLOTS, index=0)
 
         pkgs = st.number_input("Pkgs (optional)", min_value=0, value=0, step=1)
         notes = st.text_area("Notes (optional)", height=80)
@@ -525,31 +519,53 @@ with st.sidebar:
                     st.rerun()
 
 # -----------------------------
-# Main tabs (simpler)
+# Planning controls (THIS IS THE KEY FEATURE YOU ASKED FOR)
 # -----------------------------
 schedule_active = fetch_schedule(active_only=True)
-
-today = date.today()
-week_start = start_of_week(today)
-week_end = week_start + timedelta(days=6)
-
 anchor_monday = get_anchor_monday()
-slot = cycle_week_slot(week_start, anchor_monday)
 
+st.divider()
+st.subheader("Planning controls (view/print ahead)")
+
+pc1, pc2, pc3 = st.columns([1.2, 1.2, 2.6])
+
+with pc1:
+    # Choose a month to view/print
+    base = date.today().replace(day=1)
+    month_offset = st.number_input("Month offset (0=this month, 1=next, -1=prev)", value=0, step=1)
+    planned_month_date = add_months(base, int(month_offset))
+    st.caption(f"Selected month: {planned_month_date.strftime('%B %Y')}")
+
+with pc2:
+    # Choose a specific week to view/print
+    planned_week_any = st.date_input("Week (pick any day in that week)", value=date.today())
+    planned_week_start = start_of_week(planned_week_any)
+    planned_week_end = planned_week_start + timedelta(days=6)
+    planned_slot = cycle_week_slot(planned_week_start, anchor_monday)
+    st.caption(f"Week: {planned_week_start.isoformat()} → {planned_week_end.isoformat()} | Slot: {planned_slot}")
+
+with pc3:
+    st.info(
+        "These controls let you schedule now but view/print future weeks/months. "
+        "Your schedule entries are rules (weekly / W1–W4), so the app can generate Feb even if you’re in Jan."
+    )
+
+# -----------------------------
+# Main tabs
+# -----------------------------
 tab_week, tab_month, tab_print = st.tabs(["This Week", "Month View", "Print PDFs"])
 
 # -----------------------------
-# This Week: simple board + one editable table
+# Week tab (uses planned week)
 # -----------------------------
 with tab_week:
-    st.subheader(f"Current Week: {week_start.isoformat()} → {week_end.isoformat()}  |  Slot: {slot}")
+    st.subheader(f"Week: {planned_week_start.isoformat()} → {planned_week_end.isoformat()}  |  Slot: {planned_slot}")
 
-    occs = build_week_occurrences(week_start, schedule_active, slot)
+    occs = build_week_occurrences(planned_week_start, schedule_active, planned_slot)
 
     if not occs:
-        st.info("No schedules match this week. Add schedules from the sidebar.")
+        st.info("No schedules match this week (based on weekly + W1–W4).")
     else:
-        # --- Board view (landscape-like)
         st.markdown("### Board view (simple)")
         by_day_text = {d: [] for d in range(7)}
         for o in occs:
@@ -563,7 +579,7 @@ with tab_week:
 
         board_row = {}
         for i in range(7):
-            head = f"{DAYS[i][:3]} { (week_start + timedelta(days=i)).strftime('%m/%d') }"
+            head = f"{DAYS[i][:3]} { (planned_week_start + timedelta(days=i)).strftime('%m/%d') }"
             items = by_day_text[i]
             board_row[head] = "\n".join(items) if items else ""
 
@@ -571,8 +587,6 @@ with tab_week:
         st.dataframe(board_df, use_container_width=True, height=170)
 
         st.divider()
-
-        # --- Tracker table (one place to edit done/notes)
         st.markdown("### Week tracker (edit + save once)")
 
         rows = []
@@ -587,7 +601,7 @@ with tab_week:
                 "pkgs": o["pkgs"],
                 "done": (log["status"] == "done"),
                 "note": log["note"],
-                "_schedule_id": o["schedule_id"],  # hidden helper
+                "_schedule_id": o["schedule_id"],
             })
 
         df = pd.DataFrame(rows)
@@ -606,12 +620,9 @@ with tab_week:
             save = st.form_submit_button("Save week updates", type="primary", use_container_width=True)
 
         if save:
-            # compare edited 'done' + 'note' and persist
-            edited_df = edited.copy()
-            # re-attach schedule_id by merging on due_date + patient + rotation (stable enough)
             merged = pd.merge(
                 df,
-                edited_df,
+                edited,
                 on=["due_date","day","patient","rotation","cadence","pkgs"],
                 suffixes=("_old",""),
                 how="left"
@@ -625,14 +636,16 @@ with tab_week:
             st.rerun()
 
 # -----------------------------
-# Month view
+# Month tab (uses planned month)
 # -----------------------------
 with tab_month:
-    st.subheader("Current Month (Calendar view)")
-    y, m = today.year, today.month
-    first, last = month_range(today)
+    y, m = planned_month_date.year, planned_month_date.month
+    st.subheader(f"Month view: {calendar.month_name[m]} {y}")
 
-    # build occurrences for each week covering the month using the SAME cycle slot logic
+    first = date(y, m, 1)
+    last_day = calendar.monthrange(y, m)[1]
+    last = date(y, m, last_day)
+
     occs_by_day = {}
     cur = start_of_week(first)
     while cur <= last:
@@ -665,10 +678,10 @@ with tab_month:
 
     cal_df = pd.DataFrame(grid, columns=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"])
     st.dataframe(cal_df, use_container_width=True, hide_index=True)
-    st.caption("This view uses your cycle anchor so W1–W4 stays correct across months.")
+    st.caption("This month view uses the cycle anchor so W1–W4 stays correct across months.")
 
 # -----------------------------
-# Print PDFs
+# Print PDFs (choose week/month ahead)
 # -----------------------------
 with tab_print:
     st.subheader("Print PDFs (Landscape)")
@@ -676,10 +689,23 @@ with tab_print:
     if not schedule_active:
         st.info("Add schedules first.")
     else:
-        occs_week = build_week_occurrences(week_start, schedule_active, slot)
+        st.markdown("### Weekly Sheet (Landscape)")
+        week_occs = build_week_occurrences(planned_week_start, schedule_active, planned_slot)
+        week_pdf = build_week_pdf_landscape(planned_week_start, week_occs, planned_slot, anchor_monday)
+        st.download_button(
+            "Download Weekly PDF",
+            data=week_pdf,
+            file_name=f"bp_week_{planned_week_start.isoformat()}_{planned_slot}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
-        y, m = today.year, today.month
-        first, last = month_range(today)
+        st.divider()
+        st.markdown("### Month Calendar (Landscape)")
+        y, m = planned_month_date.year, planned_month_date.month
+        first = date(y, m, 1)
+        last_day = calendar.monthrange(y, m)[1]
+        last = date(y, m, last_day)
 
         occs_by_day = {}
         cur = start_of_week(first)
@@ -694,28 +720,13 @@ with tab_print:
         for k in occs_by_day:
             occs_by_day[k] = sorted(occs_by_day[k])
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("### Weekly Sheet (Landscape)")
-            week_pdf = build_week_pdf_landscape(week_start, occs_week, slot, anchor_monday)
-            st.download_button(
-                "Download Weekly PDF",
-                data=week_pdf,
-                file_name=f"bp_week_{week_start.isoformat()}_{slot}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
-        with col2:
-            st.markdown("### Month Calendar (Landscape)")
-            month_pdf = build_month_calendar_pdf(y, m, occs_by_day)
-            st.download_button(
-                "Download Month PDF",
-                data=month_pdf,
-                file_name=f"bp_month_{y}_{m:02d}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
+        month_pdf = build_month_calendar_pdf(y, m, occs_by_day)
+        st.download_button(
+            "Download Month PDF",
+            data=month_pdf,
+            file_name=f"bp_month_{y}_{m:02d}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
         st.caption("Print tip: Open PDF → Print → choose 'Fit to page' if needed.")
