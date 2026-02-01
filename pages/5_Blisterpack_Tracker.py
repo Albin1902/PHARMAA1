@@ -38,10 +38,6 @@ with st.sidebar:
         st.session_state.bp_unlocked = False
         st.info("Locked.")
 
-    # ✅ DB Debug so you can SEE if you're on the wrong file
-    with st.expander("🧪 DB Debug"):
-        st.write("cwd:", os.getcwd())
-
 if not st.session_state.bp_unlocked:
     st.title("Blister Pack Delivery Sheet (Auto Month Generator)")
     st.warning("Locked. Enter PIN to access this page.", icon="🔒")
@@ -62,13 +58,10 @@ st.warning(
     icon="⚠️"
 )
 
-
 # =========================
-# SQLite setup (FIXED path: ALWAYS project-root /data/blisterpacks.db)
+# SQLite setup  (KEEP SAME DB PATH so your data doesn't vanish)
 # =========================
-# This prevents the "DB vanished" issue when Streamlit runs pages from different working dirs.
-APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # parent of /pages
-DATA_DIR = os.path.join(APP_ROOT, "data")
+DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "blisterpacks.db")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -119,20 +112,6 @@ SUN_FIRST = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
 FREQ_LABEL = {1: "Weekly", 2: "Biweekly", 4: "Monthly"}
 LABEL_TO_FREQ = {"Weekly": 1, "Biweekly": 2, "Monthly": 4}
-
-
-# =========================
-# DB Debug (after DB path exists)
-# =========================
-with st.sidebar:
-    with st.expander("🧪 DB Debug"):
-        st.write("DB_PATH:", os.path.abspath(DB_PATH))
-        try:
-            with conn() as c:
-                n = c.execute("SELECT COUNT(*) FROM bp_patients").fetchone()[0]
-            st.write("bp_patients rows:", n)
-        except Exception as e:
-            st.write("DB error:", str(e))
 
 
 # =========================
@@ -328,6 +307,7 @@ def apply_overrides(schedule: dict[date, list[DeliveryItem]], overrides_df: pd.D
         if action == "skip":
             schedule[d] = [x for x in schedule[d] if x.name != name]
         elif action == "add":
+            # manual add shows after monthly
             schedule[d].append(DeliveryItem(name=name, packs=packs or 1, interval_weeks=99))
             schedule[d].sort(key=lambda x: (x.interval_weeks, x.name.lower()))
 
@@ -350,8 +330,8 @@ def filter_schedule(schedule: dict[date, list[DeliveryItem]], mode: str) -> dict
 
     out: dict[date, list[DeliveryItem]] = {}
     for d, items in schedule.items():
-        out[d] = [x for x in items if x.interval_weeks in allowed]
-        out[d].sort(key=lambda x: (x.interval_weeks, x.name.lower()))
+        out[d] = [it for it in items if it.interval_weeks in allowed]
+        out[d].sort(key=lambda x: (it.interval_weeks, it.name.lower()))
     return out
 
 
@@ -368,6 +348,7 @@ def truncate_to_width(text: str, max_width: float, font_name: str, font_size: in
         return ell
 
     avail = max_width - ell_w
+
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -383,33 +364,35 @@ def make_month_pdf_one_page(
     year: int,
     month: int,
     schedule: dict[date, list[DeliveryItem]],
-    page_mode: str = "letter",
-    min_font: int = 3,
-    allow_two_columns: bool = True,
+    page_mode: str = "letter",        # "letter" or "legal"
+    min_font: int = 3,                # minimum font size allowed
+    allow_two_columns: bool = True,   # pack inside cells
 ) -> bytes:
     """
     ✅ ONE PAGE ONLY
     ✅ Selected month ONLY (other-month cells blank)
     ✅ Landscape
-    ✅ No weird prefixes (W/B/M removed)
-    ✅ If too many, shows “+X more”
+    ✅ Truncates instead of wrapping; shows +X more if needed
     """
     pagesize = landscape(letter if page_mode == "letter" else legal)
     w, h = pagesize
     tmp_path = os.path.join(DATA_DIR, "_tmp_month_onepage.pdf")
     c = canvas.Canvas(tmp_path, pagesize=pagesize)
 
+    # tighter margins
     margin = 0.20 * inch
     left = margin
     right = w - margin
     bottom = margin
     top = h - margin
 
+    # compact header
     c.setFont("Helvetica-Bold", 14)
     c.drawString(left, top - 0.12 * inch, f"Blister Pack Delivery Sheet — {calendar.month_name[month]} {year}")
     c.setFont("Helvetica", 9)
     c.drawString(left, top - 0.30 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
+    # grid area
     grid_top = top - 0.45 * inch
     grid_bottom = bottom
     grid_left = left
@@ -419,14 +402,16 @@ def make_month_pdf_one_page(
     grid_h = grid_top - grid_bottom
 
     col_w = grid_w / 7.0
+
     header_h = 0.22 * inch
     body_h = grid_h - header_h
 
-    cal = calendar.Calendar(firstweekday=6)
+    cal = calendar.Calendar(firstweekday=6)  # Sunday first
     weeks = cal.monthdatescalendar(year, month)
     rows = len(weeks)
     row_h = body_h / rows
 
+    # header row background
     c.setFillGray(0.92)
     c.rect(grid_left, grid_top - header_h, grid_w, header_h, stroke=0, fill=1)
     c.setFillGray(0.0)
@@ -434,12 +419,14 @@ def make_month_pdf_one_page(
     for i, lbl in enumerate(SUN_FIRST):
         c.drawString(grid_left + i * col_w + 3, grid_top - header_h + 6, lbl)
 
+    # border
     c.setStrokeGray(0.65)
     c.rect(grid_left, grid_bottom, grid_w, grid_h, stroke=1, fill=0)
     c.line(grid_left, grid_top - header_h, grid_right, grid_top - header_h)
 
     font_name = "Helvetica"
 
+    # render cells
     for r, week in enumerate(weeks):
         y_top = grid_top - header_h - r * row_h
         y_bot = y_top - row_h
@@ -449,13 +436,15 @@ def make_month_pdf_one_page(
 
         for col, d in enumerate(week):
             x0 = grid_left + col * col_w
+            x1 = x0 + col_w
 
             c.setStrokeGray(0.65)
             c.line(x0, y_bot, x0, y_top)
 
             if d.month != month:
-                continue
+                continue  # blank other-month cells
 
+            # date number
             c.setFont("Helvetica-Bold", 9)
             c.drawString(x0 + 3, y_top - 12, str(d.day))
 
@@ -463,6 +452,7 @@ def make_month_pdf_one_page(
             if not items:
                 continue
 
+            # area for text
             pad_x = 3
             pad_y_top = 18
             pad_y_bottom = 3
@@ -472,14 +462,15 @@ def make_month_pdf_one_page(
             if area_h <= 0:
                 continue
 
+            # convert to display lines (NO W/B/M prefixes; just ordered)
             entries = [f"{it.name} ({it.packs}p)" for it in items]
 
-            def fits_single(fs: int):
+            def fits_single(fs: int) -> tuple[bool, int]:
                 line_h = fs + 0.5
                 max_lines = int(area_h // line_h)
                 return (len(entries) <= max_lines, max_lines)
 
-            def fits_two(fs: int):
+            def fits_two(fs: int) -> tuple[bool, int]:
                 if not allow_two_columns:
                     return (False, 0)
                 line_h = fs + 0.5
@@ -507,6 +498,7 @@ def make_month_pdf_one_page(
                         chosen_mode, chosen_fs, chosen_max_lines = "two", fs, max_lines
                         break
 
+            # if still not fitting: force at min_font and show +X more
             if chosen_mode is None:
                 chosen_mode = "two" if allow_two_columns else "single"
                 chosen_fs = min_font
@@ -524,6 +516,7 @@ def make_month_pdf_one_page(
                 to_print = entries[:cap]
                 remaining = len(entries) - len(to_print)
 
+                # if we’re truncating list, reserve last line for "+X more"
                 if remaining > 0 and cap >= 1:
                     to_print = entries[:cap - 1]
                     to_print.append(f"+{remaining} more")
@@ -532,6 +525,7 @@ def make_month_pdf_one_page(
                 for i, e in enumerate(to_print):
                     line = truncate_to_width(e, max_w, font_name, fs)
                     c.drawString(x0 + pad_x, y - i * line_h, line)
+
             else:
                 gap = 6
                 half_w = (col_w - 2 * pad_x - gap) / 2.0
@@ -543,6 +537,7 @@ def make_month_pdf_one_page(
                 remaining = len(entries) - len(to_print)
 
                 if remaining > 0 and cap >= 1:
+                    # reserve last slot for "+X more"
                     to_print = entries[:cap - 1]
                     to_print.append(f"+{remaining} more")
 
@@ -582,7 +577,7 @@ today = date.today()
 
 
 # -------------------------
-# Patients tab (filter + delete + safe save)
+# Patients tab (better navigation + delete)
 # -------------------------
 with tab_patients:
     st.subheader("Patients master list (Add / Edit / Delete)")
@@ -594,6 +589,7 @@ with tab_patients:
             columns=["id", "name", "weekday", "interval_weeks", "packs_per_delivery", "anchor_date", "notes", "active"]
         )
 
+    # Filters
     f1, f2, f3, f4 = st.columns([1.4, 1.1, 1.2, 1.0])
     with f1:
         q = st.text_input("Search name / notes", value="")
@@ -632,6 +628,7 @@ with tab_patients:
     if active_only and not df_view.empty:
         df_view = df_view[df_view["active"] == True]
 
+    # add delete column in editor
     if "__delete__" not in df_view.columns:
         df_view["__delete__"] = False
 
@@ -677,10 +674,12 @@ with tab_patients:
             st.info("Nothing to save.")
             st.stop()
 
+        # delete rows first
         to_delete = edited[(edited["__delete__"] == True) & (~edited["id"].isna())]
         for _, r in to_delete.iterrows():
             delete_patient_by_id(int(r["id"]))
 
+        # upsert remaining (non-deleted)
         keep = edited[edited["__delete__"] == False].drop(columns=["__delete__"], errors="ignore")
 
         bad = keep[keep["name"].astype(str).str.strip() == ""]
@@ -757,8 +756,7 @@ with tab_overrides:
 
 
 # -------------------------
-# Calendar tab
-# ✅ default view = Biweekly + Monthly (as you wanted)
+# Calendar tab (DEFAULT = Biweekly+Monthly)
 # -------------------------
 with tab_cal:
     c1, c2, c3 = st.columns([1, 1, 1.6])
@@ -775,7 +773,7 @@ with tab_cal:
         view_mode = st.radio(
             "View",
             ["Biweekly + Monthly", "Weekly", "All"],
-            index=0,
+            index=0,  # ✅ default as you asked
             horizontal=True,
         )
 
@@ -818,6 +816,7 @@ with tab_cal:
             items = schedule.get(d, [])
             items = sorted(items, key=lambda x: (x.interval_weeks, x.name.lower()))
 
+            # show many but keep UI readable
             shown = items[:14]
             extra = max(0, len(items) - len(shown))
 
@@ -840,8 +839,7 @@ with tab_cal:
 
 
 # -------------------------
-# Print tab
-# ✅ lets you download Monthly PDF as Weekly or Biweekly+Monthly (separate)
+# Print tab (download matches Weekly vs Biweekly+Monthly)
 # -------------------------
 with tab_print:
     st.subheader("Print PDFs (Landscape • One Page • Selected Month Only)")
@@ -863,8 +861,8 @@ with tab_print:
 
     scope = st.radio(
         "Month PDF scope",
-        ["Weekly", "Biweekly + Monthly", "All"],
-        index=1,
+        ["Biweekly + Monthly", "Weekly", "All"],
+        index=0,
         horizontal=True,
     )
 
@@ -897,4 +895,4 @@ with tab_print:
         type="primary",
     )
 
-    st.caption("If a cell is too packed, PDF shows “+X more” instead of silently dropping names.")
+    st.caption("If a cell still has too many, the PDF will show “+X more” instead of silently dropping names.")
