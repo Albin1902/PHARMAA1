@@ -1113,7 +1113,3 @@ with tab_io:
         except Exception as e:
             st.error(f"Import failed: {e}")
 
-    st.divider()
-    st.markdown("### If you still want Excel (.xlsx) import")
-    st.write("Add this to your `requirements.txt` and redeploy:")
-    st.code("openpyxl", language="text")
