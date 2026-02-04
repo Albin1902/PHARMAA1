@@ -777,7 +777,7 @@ def make_daily_delivery_pdf(
 
     # Add RX blank lines
     for _ in range(extra_rx_lines):
-        rows.append(["RX", "", "", "", "", ""])
+        rows.append(["", "", "", "", "", ""])
 
     # Clip rows to one page
     rows = rows[:max_rows]
