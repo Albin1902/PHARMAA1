@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from reportlab.lib.pagesizes import letter, legal
+from reportlab.lib.pagesizes import letter, legal, landscape, portrait
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
@@ -161,7 +161,7 @@ def build_day_rows(d: date) -> list[DeliveryRow]:
     ov = read_overrides(ms, me)
 
     if not ov.empty:
-        # skip
+        # skip/add
         for _, r in ov[ov["odate"] == d].iterrows():
             action = str(r["action"]).strip().lower()
             pname = str(r["patient_name"]).strip()
@@ -205,8 +205,16 @@ def truncate(text: str, max_w: float, font: str, size: int) -> str:
     return text[:cut].rstrip() + ell
 
 
-def make_daily_pdf(d: date, rows: list[DeliveryRow], extra_blank_rows: int, paper: str = "letter") -> bytes:
-    pagesize = letter if paper == "letter" else legal
+def make_daily_pdf(
+    d: date,
+    rows: list[DeliveryRow],
+    extra_blank_rows: int,
+    paper: str = "letter",
+    orientation: str = "portrait",
+) -> bytes:
+    base = letter if paper == "letter" else legal
+    pagesize = landscape(base) if orientation == "landscape" else portrait(base)
+
     w, h = pagesize
     tmp_path = os.path.join(DATA_DIR, "_tmp_daily.pdf")
     c = canvas.Canvas(tmp_path, pagesize=pagesize)
@@ -234,7 +242,6 @@ def make_daily_pdf(d: date, rows: list[DeliveryRow], extra_blank_rows: int, pape
     table_h = table_top - table_bottom
 
     # columns: Type | Patient | Address | Notes | Packages | Charged
-    # ✅ Notes smaller, Packages/Charged not weird
     col_w = [
         0.95 * inch,   # Type
         2.15 * inch,   # Patient
@@ -280,7 +287,7 @@ def make_daily_pdf(d: date, rows: list[DeliveryRow], extra_blank_rows: int, pape
 
     # horizontal lines
     y = table_top
-    for i in range(total_rows + 1):
+    for _ in range(total_rows + 1):
         c.line(left, y, right, y)
         y -= row_h
 
@@ -302,10 +309,7 @@ def make_daily_pdf(d: date, rows: list[DeliveryRow], extra_blank_rows: int, pape
         c.drawString(left + col_w[0] + 4, y + 6, cell_text(1, r.patient))
         c.drawString(left + col_w[0] + col_w[1] + 4, y + 6, cell_text(2, r.address))
         c.drawString(left + col_w[0] + col_w[1] + col_w[2] + 4, y + 6, cell_text(3, r.note))
-        # Packages + Charged must be EMPTY (you fill manually)
-
-    # ✅ extra blank rows: Type should be BLANK (not RX)
-    # We already draw blank grid lines; no need to print text.
+        # Packages + Charged left EMPTY (manual fill)
 
     c.showPage()
     c.save()
@@ -325,8 +329,14 @@ def make_daily_pdf(d: date, rows: list[DeliveryRow], extra_blank_rows: int, pape
 st.title("Daily Delivery Sheet (BP + manual extras)")
 
 pick = st.date_input("Pick day to print", value=date.today())
-paper = st.selectbox("Paper size", ["letter", "legal"], index=0)
-extra = st.slider("Extra blank lines (for extra deliveries)", 0, 60, 20)
+
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    paper = st.selectbox("Paper size", ["letter", "legal"], index=0)
+with c2:
+    orientation = st.selectbox("Print layout", ["portrait", "landscape"], index=0)
+with c3:
+    extra = st.slider("Extra blank lines (for extra deliveries)", 0, 60, 20)
 
 rows = build_day_rows(pick)
 
@@ -337,12 +347,18 @@ else:
     df = pd.DataFrame([{"Type": r.type_label, "Patient": r.patient, "Address": r.address, "Notes": r.note} for r in rows])
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-pdf = make_daily_pdf(pick, rows, extra_blank_rows=extra, paper=paper)
+pdf = make_daily_pdf(
+    pick,
+    rows,
+    extra_blank_rows=extra,
+    paper=paper,
+    orientation=orientation,
+)
 
 st.download_button(
     "Download Daily PDF (SDM DELIVERY SHEET LOG)",
     data=pdf,
-    file_name=f"sdm_delivery_sheet_{pick.isoformat()}.pdf",
+    file_name=f"sdm_delivery_sheet_{pick.isoformat()}_{orientation}.pdf",
     mime="application/pdf",
     type="primary",
 )
