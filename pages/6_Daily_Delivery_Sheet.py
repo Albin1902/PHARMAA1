@@ -1,7 +1,7 @@
 import os
 import sqlite3
-from dataclasses import dataclass
-from datetime import date, datetime
+import calendar
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -15,7 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 # =========================
 # Page config + PIN lock
 # =========================
-st.set_page_config(page_title="Daily Delivery Sheet", layout="wide")
+st.set_page_config(page_title="SDM Delivery Sheet Log", layout="wide")
 
 PIN_VALUE = str(st.secrets.get("BP_PIN", "2026"))
 
@@ -23,12 +23,16 @@ if "bp_unlocked" not in st.session_state:
     st.session_state.bp_unlocked = False
 
 with st.sidebar:
-    st.markdown("### 🔒 Delivery Sheet Lock")
+    st.markdown("### 🔒 Blisterpack Tracker Lock")
     pin_in = st.text_input("Enter PIN", type="password", placeholder="PIN")
     c_unlock, c_lock = st.columns(2)
     if c_unlock.button("Unlock", use_container_width=True):
-        st.session_state.bp_unlocked = (pin_in == PIN_VALUE)
-        st.success("Unlocked.") if st.session_state.bp_unlocked else st.error("Wrong PIN.")
+        if pin_in == PIN_VALUE:
+            st.session_state.bp_unlocked = True
+            st.success("Unlocked.")
+        else:
+            st.session_state.bp_unlocked = False
+            st.error("Wrong PIN.")
     if c_lock.button("Lock", use_container_width=True):
         st.session_state.bp_unlocked = False
         st.info("Locked.")
@@ -40,7 +44,7 @@ if not st.session_state.bp_unlocked:
 
 
 # =========================
-# DB setup (same DB as tracker)
+# DB setup (same DB)
 # =========================
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "blisterpacks.db")
@@ -48,76 +52,24 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def conn():
-    c = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA synchronous=NORMAL;")
-    c.execute("PRAGMA busy_timeout=5000;")
-    return c
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-
-def table_columns(c, table_name: str) -> set[str]:
-    rows = c.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {r[1] for r in rows}
-
-
-def init_db():
-    with conn() as c:
-        # Must exist
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bp_patients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                weekday INTEGER NOT NULL,
-                interval_weeks INTEGER NOT NULL,
-                packs_per_delivery INTEGER NOT NULL,
-                anchor_date TEXT NOT NULL,
-                notes TEXT,
-                active INTEGER NOT NULL DEFAULT 1
-            )
-            """
-        )
-
-        # Optional columns used by daily sheet (safe migration)
-        cols = table_columns(c, "bp_patients")
-        if "address" not in cols:
-            c.execute("ALTER TABLE bp_patients ADD COLUMN address TEXT")
-        if "packages_per_delivery" not in cols:
-            c.execute("ALTER TABLE bp_patients ADD COLUMN packages_per_delivery INTEGER")
-        if "charge_code" not in cols:
-            c.execute("ALTER TABLE bp_patients ADD COLUMN charge_code TEXT")
-
-        c.execute("UPDATE bp_patients SET address = COALESCE(address, '')")
-        c.execute("UPDATE bp_patients SET packages_per_delivery = COALESCE(packages_per_delivery, 1)")
-        c.execute("UPDATE bp_patients SET charge_code = COALESCE(charge_code, '0')")
-
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bp_overrides (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                odate TEXT NOT NULL,
-                patient_name TEXT NOT NULL,
-                action TEXT NOT NULL,
-                packs INTEGER,
-                note TEXT
-            )
-            """
-        )
-        c.commit()
-
-
-init_db()
 
 WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    end = date(year, month, last_day)
+    return start, end
 
 
 def read_patients() -> pd.DataFrame:
     with conn() as c:
         df = pd.read_sql_query(
             """
-            SELECT id, name, weekday, interval_weeks, packs_per_delivery,
-                   anchor_date, notes, active,
-                   address, packages_per_delivery, charge_code
+            SELECT id, name, address, weekday, interval_weeks, packs_per_delivery, anchor_date, notes, active
             FROM bp_patients
             ORDER BY active DESC, weekday ASC, interval_weeks ASC, name ASC
             """,
@@ -127,28 +79,27 @@ def read_patients() -> pd.DataFrame:
         return df
     df["anchor_date"] = pd.to_datetime(df["anchor_date"]).dt.date
     df["active"] = df["active"].astype(bool)
-    for col in ["notes", "address", "charge_code"]:
-        df[col] = df[col].fillna("").astype(str)
-    df["packages_per_delivery"] = pd.to_numeric(df["packages_per_delivery"], errors="coerce").fillna(1).astype(int)
+    df["address"] = df["address"].fillna("")
+    df["notes"] = df["notes"].fillna("")
     return df
 
 
-def read_overrides_for_day(d: date) -> pd.DataFrame:
+def read_overrides(month_start: date, month_end: date) -> pd.DataFrame:
     with conn() as c:
         df = pd.read_sql_query(
             """
             SELECT id, odate, patient_name, action, packs, note
             FROM bp_overrides
-            WHERE odate = ?
-            ORDER BY patient_name ASC
+            WHERE odate >= ? AND odate <= ?
+            ORDER BY odate ASC, patient_name ASC
             """,
             c,
-            params=(d.isoformat(),),
+            params=(month_start.isoformat(), month_end.isoformat()),
         )
     if df.empty:
         return df
     df["odate"] = pd.to_datetime(df["odate"]).dt.date
-    df["note"] = df["note"].fillna("").astype(str)
+    df["note"] = df["note"].fillna("")
     return df
 
 
@@ -160,68 +111,67 @@ def occurs_on_day(anchor: date, interval_weeks: int, d: date) -> bool:
     return (weeks_between % interval_weeks) == 0
 
 
-@dataclass
-class DeliveryItem:
-    name: str
-    packs: int
-    interval_weeks: int  # 1,2,4, 99 manual add
-    override_note: str = ""
+def build_month_schedule(year: int, month: int, patients_df: pd.DataFrame) -> dict[date, list[dict]]:
+    # returns {date: [ {name,packs,interval,address}, ... ] }
+    start, end = month_bounds(year, month)
+    schedule = {}
+    d = start
+    while d <= end:
+        schedule[d] = []
+        d += timedelta(days=1)
 
-
-def build_day_bp_list(d: date, patients_df: pd.DataFrame) -> list[DeliveryItem]:
-    """Auto schedule for ONE day (weekdays only)."""
     if patients_df.empty:
-        return []
-    if d.weekday() > 4:
-        return []
+        return schedule
 
     active = patients_df[patients_df["active"] == True].copy()
     if active.empty:
-        return []
+        return schedule
 
-    todays = active[active["weekday"] == d.weekday()]
-    out: list[DeliveryItem] = []
+    for d in list(schedule.keys()):
+        # auto schedule weekdays only
+        if d.weekday() > 4:
+            continue
 
-    for _, r in todays.iterrows():
-        anchor = r["anchor_date"]
-        if occurs_on_day(anchor, int(r["interval_weeks"]), d):
-            out.append(
-                DeliveryItem(
-                    name=str(r["name"]),
-                    packs=int(r["packs_per_delivery"]),
-                    interval_weeks=int(r["interval_weeks"]),
-                )
-            )
+        todays = active[active["weekday"] == d.weekday()]
+        if todays.empty:
+            continue
 
-    out.sort(key=lambda x: (x.interval_weeks, x.name.lower()))
-    return out
+        for _, r in todays.iterrows():
+            anchor = r["anchor_date"]
+            interval = int(r["interval_weeks"])
+            if occurs_on_day(anchor, interval, d):
+                schedule[d].append({
+                    "name": str(r["name"]),
+                    "packs": int(r["packs_per_delivery"]),
+                    "interval": interval,
+                    "address": str(r.get("address", "") or ""),
+                })
+
+        schedule[d].sort(key=lambda x: (x["packs"], x["name"].lower()))
+    return schedule
 
 
-def apply_overrides_to_day(items: list[DeliveryItem], overrides_df: pd.DataFrame) -> list[DeliveryItem]:
+def apply_overrides(schedule: dict[date, list[dict]], overrides_df: pd.DataFrame):
     if overrides_df.empty:
-        return items
-
-    out = items[:]
+        return schedule
     for _, r in overrides_df.iterrows():
+        d = r["odate"]
         name = str(r["patient_name"])
         action = str(r["action"]).lower().strip()
         packs = None if pd.isna(r.get("packs", None)) else int(r["packs"])
-        note = str(r.get("note", "") or "").strip()
+
+        if d not in schedule:
+            continue
 
         if action == "skip":
-            out = [x for x in out if x.name != name]
+            schedule[d] = [x for x in schedule[d] if x["name"] != name]
         elif action == "add":
-            out.append(DeliveryItem(name=name, packs=packs or 1, interval_weeks=99, override_note=note))
+            schedule[d].append({"name": name, "packs": packs or 1, "interval": 99, "address": ""})
+            schedule[d].sort(key=lambda x: (x["packs"], x["name"].lower()))
+    return schedule
 
-    out.sort(key=lambda x: (x.interval_weeks, x.name.lower()))
-    return out
 
-
-# =========================
-# PDF helpers
-# =========================
 def truncate_to_width(text: str, max_width: float, font_name: str, font_size: int) -> str:
-    text = "" if text is None else str(text)
     if pdfmetrics.stringWidth(text, font_name, font_size) <= max_width:
         return text
     ell = "…"
@@ -229,6 +179,7 @@ def truncate_to_width(text: str, max_width: float, font_name: str, font_size: in
     if ell_w >= max_width:
         return ell
     avail = max_width - ell_w
+
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -240,135 +191,174 @@ def truncate_to_width(text: str, max_width: float, font_name: str, font_size: in
     return text[:cut].rstrip() + ell
 
 
-def make_daily_pdf_one_sheet(
+def make_daily_pdf(
     delivery_date: date,
-    df_lines: pd.DataFrame,
+    rows: list[dict],
     page_mode: str = "letter",
-    extra_blank_rows: int = 12,
-    fill_page_with_blanks: bool = True,
+    rx_rows: int = 8,
 ) -> bytes:
     """
-    ✅ SINGLE PAGE ONLY
-    ✅ Type column shows: 1 BP / 2 BP / 4 BP / RX
-    ✅ Header centered: SDM DELIVERY SHEET LOG + Day + Date
-    ✅ Packages + Charged printed BLANK (always)
-    ✅ Adds lined blanks to write more deliveries
+    ONE PAGE daily sheet:
+      Type | Patient | Address | Notes | Packages | Charged
+    - Type values like: "1 BP", "2 BP", "4 BP", "RX"
+    - Packages/Charged EMPTY for writing
+    - Adds RX blank rows + extra blanks until page filled
     """
     pagesize = landscape(letter if page_mode == "letter" else legal)
     w, h = pagesize
-
-    tmp_path = os.path.join(DATA_DIR, "_tmp_daily_one_sheet.pdf")
+    tmp_path = os.path.join(DATA_DIR, "_tmp_daily.pdf")
     c = canvas.Canvas(tmp_path, pagesize=pagesize)
 
     margin = 0.35 * inch
-    left, right = margin, w - margin
-    bottom, top = margin, h - margin
+    left = margin
+    right = w - margin
+    top = h - margin
+    bottom = margin
 
-    # Centered headers
-    title1 = "SDM DELIVERY SHEET LOG"
-    title2 = f"{delivery_date.strftime('%A')} — {delivery_date.isoformat()}"
-
+    # Title centered
     c.setFont("Helvetica-Bold", 18)
-    c.drawCentredString((left + right) / 2, top - 0.20 * inch, title1)
+    c.drawCentredString(w / 2, top, "SDM DELIVERY SHEET LOG")
 
-    c.setFont("Helvetica-Bold", 13)
-    c.drawCentredString((left + right) / 2, top - 0.45 * inch, title2)
+    c.setFont("Helvetica-Bold", 12)
+    subtitle = f"{delivery_date.strftime('%A')} — {delivery_date.isoformat()}"
+    c.drawCentredString(w / 2, top - 0.28 * inch, subtitle)
 
     c.setFont("Helvetica", 9)
-    c.drawRightString(right, top - 0.65 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    c.drawRightString(right, top - 0.28 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    # Table area
-    table_top = top - 0.85 * inch
+    table_top = top - 0.55 * inch
+    table_bottom = bottom
     table_left = left
     table_right = right
+
     table_w = table_right - table_left
+    table_h = table_top - table_bottom
+
+    header_h = 0.30 * inch
+    row_h = 0.30 * inch
+
+    # Type, Patient, Address, Notes, Packages, Charged
+    # Notes smaller; Packages/Charged wider so headers don't smash
+    col_fracs = [0.10, 0.24, 0.43, 0.13, 0.05, 0.05]
+    col_w = [table_w * f for f in col_fracs]
 
     headers = ["Type", "Patient", "Address", "Notes", "Packages", "Charged"]
 
-    # Type short, Address wide, Notes medium
-    col_fracs = [0.10, 0.23, 0.42, 0.13, 0.06, 0.06]  # sums to 1.00
-    col_w = [table_w * f for f in col_fracs]
+    # calculate max rows that fit
+    max_rows = int((table_h - header_h) // row_h)
+    if max_rows < 1:
+        max_rows = 1
 
-    fs_header = 10
-    fs_body = 9
-    row_h = 0.30 * inch
-    header_h = 0.30 * inch
+    # Build final printable rows
+    out_rows = []
+    for r in rows:
+        out_rows.append({
+            "type": f'{int(r.get("packs", 1))} BP',
+            "patient": str(r.get("name", "")),
+            "address": str(r.get("address", "")),
+            "notes": "",
+            "packages": "",
+            "charged": "",
+        })
 
-    usable_h = (table_top - bottom)
-    max_rows = int((usable_h - header_h) // row_h)
-    if max_rows < 8:
-        max_rows = 8
+    # RX blanks
+    for _ in range(rx_rows):
+        out_rows.append({
+            "type": "RX",
+            "patient": "",
+            "address": "",
+            "notes": "",
+            "packages": "",
+            "charged": "",
+        })
 
-    df = df_lines.copy() if df_lines is not None else pd.DataFrame(columns=headers)
-    for col in headers:
-        if col not in df.columns:
-            df[col] = ""
+    # Fill remaining with blanks (no Type)
+    while len(out_rows) < max_rows:
+        out_rows.append({
+            "type": "",
+            "patient": "",
+            "address": "",
+            "notes": "",
+            "packages": "",
+            "charged": "",
+        })
 
-    # Always print these blank
-    df["Packages"] = ""
-    df["Charged"] = ""
+    out_rows = out_rows[:max_rows]
 
-    # Add handwriting blank lines
-    blanks = pd.DataFrame([{h: "" for h in headers} for _ in range(int(extra_blank_rows))])
-    df = pd.concat([df, blanks], ignore_index=True)
-
-    # Fill to page if needed
-    if fill_page_with_blanks and len(df) < max_rows:
-        more = max_rows - len(df)
-        df = pd.concat([df, pd.DataFrame([{h: "" for h in headers} for _ in range(more)])], ignore_index=True)
-
-    # HARD CAP: single page only
-    rows = df.to_dict("records")[:max_rows]
-
-    # Header band
-    c.setStrokeGray(0.70)
+    # Header background
     c.setFillGray(0.92)
-    c.rect(table_left, table_top - header_h, table_w, header_h, stroke=1, fill=1)
+    c.rect(table_left, table_top - header_h, table_w, header_h, stroke=0, fill=1)
+    c.setFillGray(0)
 
-    c.setFillGray(0.0)
+    # Header text (slightly smaller + centered on tiny cols)
+    fs_header = 9
     c.setFont("Helvetica-Bold", fs_header)
 
     x = table_left
     for i, htxt in enumerate(headers):
-    max_w = col_w[i] - 8
-    label = truncate_to_width(htxt, max_w, "Helvetica-Bold", fs_header)
+        max_w = col_w[i] - 8
+        label = truncate_to_width(htxt, max_w, "Helvetica-Bold", fs_header)
 
-    # Center the tiny columns so they look clean
-    if htxt in ("Packages", "Charged"):
-        c.drawCentredString(x + (col_w[i] / 2), table_top - header_h + 8, label)
-    else:
-        c.drawString(x + 4, table_top - header_h + 8, label)
+        if htxt in ("Packages", "Charged"):
+            c.drawCentredString(x + (col_w[i] / 2), table_top - header_h + 9, label)
+        else:
+            c.drawString(x + 4, table_top - header_h + 9, label)
 
-    x += col_w[i]
+        x += col_w[i]
+
+    # Grid
+    c.setStrokeGray(0.70)
+
+    # Outer border
+    c.rect(table_left, table_top - header_h - (max_rows * row_h), table_w, header_h + (max_rows * row_h), stroke=1, fill=0)
 
     # Vertical lines
     x = table_left
-    for i in range(len(col_w) + 1):
-        c.line(x, table_top, x, bottom)
-        if i < len(col_w):
-            x += col_w[i]
+    for wcol in col_w:
+        c.line(x, table_top, x, table_top - header_h - (max_rows * row_h))
+        x += wcol
+    c.line(table_right, table_top, table_right, table_top - header_h - (max_rows * row_h))
 
-    # Body rows (lined)
-    c.setFont("Helvetica", fs_body)
+    # Horizontal lines
     y = table_top - header_h
+    c.line(table_left, y, table_right, y)
+    for r in range(max_rows):
+        y2 = y - row_h
+        c.line(table_left, y2, table_right, y2)
+        y = y2
 
-    for r in rows:
-        c.line(table_left, y, table_right, y)
-        c.line(table_left, y - row_h, table_right, y - row_h)
+    # Fill text
+    fs = 9
+    c.setFont("Helvetica", fs)
+
+    y = table_top - header_h
+    for r in range(max_rows):
+        row = out_rows[r]
+        y_text = y - row_h + 0.20 * inch
+
+        cols = [
+            row["type"],
+            row["patient"],
+            row["address"],
+            row["notes"],
+            row["packages"],
+            row["charged"],
+        ]
 
         x = table_left
-        for ci, key in enumerate(headers):
-            val = "" if r.get(key) is None else str(r.get(key))
-            if key in ["Packages", "Charged"]:
-                val = ""
-            max_w = col_w[ci] - 8
-            c.drawString(x + 4, y - 0.20 * inch, truncate_to_width(val, max_w, "Helvetica", fs_body))
-            x += col_w[ci]
+        for i, txt in enumerate(cols):
+            max_w = col_w[i] - 8
+            line = truncate_to_width(str(txt), max_w, "Helvetica", fs)
+
+            # center tiny cols
+            if i in (4, 5):
+                c.drawCentredString(x + col_w[i] / 2, y_text, line)
+            else:
+                c.drawString(x + 4, y_text, line)
+
+            x += col_w[i]
 
         y -= row_h
-
-    # bottom border line
-    c.line(table_left, y, table_right, y)
 
     c.showPage()
     c.save()
@@ -386,105 +376,41 @@ def make_daily_pdf_one_sheet(
 # UI
 # =========================
 st.title("SDM DELIVERY SHEET LOG")
+st.caption("Auto-fills BP deliveries from your schedule + adds RX blank lines. One page, printable.")
+
+today = date.today()
+
+c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
+with c1:
+    dsel = st.date_input("Delivery date", value=today)
+with c2:
+    page_mode = st.selectbox("Paper size", ["letter", "legal"], index=0)
+with c3:
+    rx_rows = st.number_input("RX blank rows", min_value=0, max_value=40, value=8, step=1)
 
 patients_df = read_patients()
 
-c1, c2, c3, c4 = st.columns([1.2, 1.1, 1.0, 1.2])
-with c1:
-    dpick = st.date_input("Delivery date", value=date.today())
-with c2:
-    scope = st.radio("Auto-fill scope", ["All", "Weekly", "Biweekly + Monthly"], index=0, horizontal=True)
-with c3:
-    paper = st.selectbox("Paper", ["letter", "legal"], index=0)
-with c4:
-    extra_lines = st.number_input("Extra blank lined rows", min_value=0, max_value=60, value=12, step=1)
+# Build schedule for selected date’s month + overrides
+base = build_month_schedule(dsel.year, dsel.month, patients_df)
+ms, me = month_bounds(dsel.year, dsel.month)
+ov = read_overrides(ms, me)
+base = apply_overrides(base, ov)
 
-fill_page = st.toggle("Fill page with blank lines", value=True)
+rows = base.get(dsel, [])
+rows = sorted(rows, key=lambda x: (x["packs"], x["name"].lower()))
 
-# Build auto list
-items = build_day_bp_list(dpick, patients_df)
-ov = read_overrides_for_day(dpick)
-items = apply_overrides_to_day(items, ov)
+st.subheader(f"{dsel.strftime('%A')} — {dsel.isoformat()}")
+if not rows:
+    st.info("No BP deliveries scheduled for this day (auto). PDF will still include RX + blank lines.")
+else:
+    st.dataframe(pd.DataFrame(rows)[["packs", "name", "address"]], use_container_width=True, hide_index=True)
 
-# Filter by scope
-def allow(it: DeliveryItem, scope: str) -> bool:
-    if scope == "Weekly":
-        return it.interval_weeks in {1, 99}
-    if scope == "Biweekly + Monthly":
-        return it.interval_weeks in {2, 4, 99}
-    return it.interval_weeks in {1, 2, 4, 99}
-
-items = [it for it in items if allow(it, scope)]
-
-# Name lookup for address/notes
-by_name = {}
-if not patients_df.empty:
-    for _, r in patients_df.iterrows():
-        by_name[str(r["name"])] = r
-
-# Build table rows:
-# Type column must be: 1 BP / 2 BP / 4 BP / RX
-rows = []
-for it in items:
-    r = by_name.get(it.name, None)
-    addr = "" if r is None else str(r.get("address", "") or "")
-    notes = "" if r is None else str(r.get("notes", "") or "")
-    if it.override_note:
-        notes = (notes + " | " + it.override_note).strip(" |")
-
-    bp_type = f"{int(it.packs)} BP"  # <-- EXACTLY what you asked
-    rows.append(
-        {
-            "Type": bp_type,
-            "Patient": it.name,
-            "Address": addr,
-            "Notes": notes,
-            "Packages": "",  # print blank
-            "Charged": "",   # print blank
-        }
-    )
-
-# Add a few default RX lines so you can type before printing
-for _ in range(8):
-    rows.append({"Type": "RX", "Patient": "", "Address": "", "Notes": "", "Packages": "", "Charged": ""})
-
-df_lines = pd.DataFrame(rows, columns=["Type", "Patient", "Address", "Notes", "Packages", "Charged"])
-
-st.subheader(f"{dpick.strftime('%A')} — {dpick.isoformat()} ({scope})")
-
-edited = st.data_editor(
-    df_lines,
-    use_container_width=True,
-    num_rows="dynamic",
-    hide_index=True,
-    column_config={
-        "Type": st.column_config.SelectboxColumn(
-            "Type",
-            options=["1 BP", "2 BP", "4 BP", "RX"],
-            required=False
-        ),
-        "Patient": st.column_config.TextColumn("Patient"),
-        "Address": st.column_config.TextColumn("Address"),
-        "Notes": st.column_config.TextColumn("Notes"),
-        "Packages": st.column_config.TextColumn("Packages (write on paper)"),
-        "Charged": st.column_config.TextColumn("Charged (cc/0) (write on paper)"),
-    },
-)
-
-st.caption("Packages + Charged will PRINT BLANK so you can fill by pen.")
-
-pdf_bytes = make_daily_pdf_one_sheet(
-    delivery_date=dpick,
-    df_lines=edited,
-    page_mode=paper,
-    extra_blank_rows=int(extra_lines),
-    fill_page_with_blanks=fill_page,
-)
+pdf = make_daily_pdf(dsel, rows, page_mode=page_mode, rx_rows=int(rx_rows))
 
 st.download_button(
-    "Download Daily PDF (ONE SHEET)",
-    data=pdf_bytes,
-    file_name=f"sdm_delivery_sheet_{dpick.isoformat()}.pdf",
+    "Download Daily Sheet PDF (ONE PAGE)",
+    data=pdf,
+    file_name=f"sdm_delivery_sheet_{dsel.isoformat()}.pdf",
     mime="application/pdf",
     type="primary",
 )
