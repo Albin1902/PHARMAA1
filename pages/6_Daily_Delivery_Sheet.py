@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -34,7 +34,7 @@ with st.sidebar:
         st.info("Locked.")
 
 if not st.session_state.bp_unlocked:
-    st.title("Daily Delivery Sheet (BP + RX)")
+    st.title("SDM DELIVERY SHEET LOG")
     st.warning("Locked. Enter PIN to access this page.", icon="🔒")
     st.stop()
 
@@ -62,7 +62,7 @@ def table_columns(c, table_name: str) -> set[str]:
 
 def init_db():
     with conn() as c:
-        # Base table (must exist)
+        # Must exist
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS bp_patients (
@@ -78,7 +78,7 @@ def init_db():
             """
         )
 
-        # Auto-migrate extra fields (safe, no wipe)
+        # Optional columns used by daily sheet (safe migration)
         cols = table_columns(c, "bp_patients")
         if "address" not in cols:
             c.execute("ALTER TABLE bp_patients ADD COLUMN address TEXT")
@@ -172,9 +172,7 @@ def build_day_bp_list(d: date, patients_df: pd.DataFrame) -> list[DeliveryItem]:
     """Auto schedule for ONE day (weekdays only)."""
     if patients_df.empty:
         return []
-
     if d.weekday() > 4:
-        # weekends: nothing auto (you can still add manual lines)
         return []
 
     active = patients_df[patients_df["active"] == True].copy()
@@ -186,19 +184,15 @@ def build_day_bp_list(d: date, patients_df: pd.DataFrame) -> list[DeliveryItem]:
 
     for _, r in todays.iterrows():
         anchor = r["anchor_date"]
-        if isinstance(anchor, pd.Timestamp):
-            anchor = anchor.date()
-        interval = int(r["interval_weeks"])
-        if occurs_on_day(anchor, interval, d):
+        if occurs_on_day(anchor, int(r["interval_weeks"]), d):
             out.append(
                 DeliveryItem(
                     name=str(r["name"]),
                     packs=int(r["packs_per_delivery"]),
-                    interval_weeks=int(interval),
+                    interval_weeks=int(r["interval_weeks"]),
                 )
             )
 
-    # weekly -> biweekly -> monthly -> manual (99) then name
     out.sort(key=lambda x: (x.interval_weeks, x.name.lower()))
     return out
 
@@ -223,6 +217,9 @@ def apply_overrides_to_day(items: list[DeliveryItem], overrides_df: pd.DataFrame
     return out
 
 
+# =========================
+# PDF helpers
+# =========================
 def truncate_to_width(text: str, max_width: float, font_name: str, font_size: int) -> str:
     text = "" if text is None else str(text)
     if pdfmetrics.stringWidth(text, font_name, font_size) <= max_width:
@@ -243,153 +240,127 @@ def truncate_to_width(text: str, max_width: float, font_name: str, font_size: in
     return text[:cut].rstrip() + ell
 
 
-def make_daily_pdf_grid(
+def make_daily_pdf_one_sheet(
     delivery_date: date,
     df_lines: pd.DataFrame,
     page_mode: str = "letter",
+    extra_blank_rows: int = 12,
     fill_page_with_blanks: bool = True,
-    extra_blank_rows: int = 10,
 ) -> bytes:
     """
-    Daily PDF grid for hand-writing:
-      - Auto-filled BP rows + manual RX rows
-      - Keeps blank row lines to write more
-      - Packages + Charged ALWAYS left blank on print (as requested)
-      - BP col short, Notes shorter, Address wide
+    ✅ SINGLE PAGE ONLY
+    ✅ Type column shows: 1 BP / 2 BP / 4 BP / RX
+    ✅ Header centered: SDM DELIVERY SHEET LOG + Day + Date
+    ✅ Packages + Charged printed BLANK (always)
+    ✅ Adds lined blanks to write more deliveries
     """
     pagesize = landscape(letter if page_mode == "letter" else legal)
     w, h = pagesize
 
-    tmp_path = os.path.join(DATA_DIR, "_tmp_daily_grid.pdf")
+    tmp_path = os.path.join(DATA_DIR, "_tmp_daily_one_sheet.pdf")
     c = canvas.Canvas(tmp_path, pagesize=pagesize)
 
     margin = 0.35 * inch
     left, right = margin, w - margin
     bottom, top = margin, h - margin
 
-    title = f"Delivery Sheet — {delivery_date.isoformat()} (BP + RX)"
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(left, top - 0.15 * inch, title)
-    c.setFont("Helvetica", 9)
-    c.drawString(left, top - 0.40 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    # Centered headers
+    title1 = "SDM DELIVERY SHEET LOG"
+    title2 = f"{delivery_date.strftime('%A')} — {delivery_date.isoformat()}"
 
-    table_top = top - 0.65 * inch
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString((left + right) / 2, top - 0.20 * inch, title1)
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawCentredString((left + right) / 2, top - 0.45 * inch, title2)
+
+    c.setFont("Helvetica", 9)
+    c.drawRightString(right, top - 0.65 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    # Table area
+    table_top = top - 0.85 * inch
     table_left = left
     table_right = right
     table_w = table_right - table_left
 
-    # Column widths (sum = 1.00)
-    # Type | BP | Patient | Address | Notes | Packages | Charged
-    col_fracs = [0.06, 0.05, 0.20, 0.37, 0.18, 0.07, 0.07]
-    col_w = [table_w * f for f in col_fracs]
-    headers = ["Type", "BP", "Patient", "Address", "Notes", "Packages", "Charged"]
+    headers = ["Type", "Patient", "Address", "Notes", "Packages", "Charged"]
 
-    font_name = "Helvetica"
+    # Type short, Address wide, Notes medium
+    col_fracs = [0.10, 0.22, 0.40, 0.18, 0.05, 0.05]  # sums to 1.00
+    col_w = [table_w * f for f in col_fracs]
+
     fs_header = 10
     fs_body = 9
-    row_h = 0.30 * inch  # strong lines for writing
-
-    # How many rows fit on one page?
-    usable_h = (table_top - bottom)
+    row_h = 0.30 * inch
     header_h = 0.30 * inch
+
+    usable_h = (table_top - bottom)
     max_rows = int((usable_h - header_h) // row_h)
-    if max_rows < 5:
-        max_rows = 5
+    if max_rows < 8:
+        max_rows = 8
 
-    # Build rows to print (truncate to max_rows, or add blanks)
-    df = df_lines.copy() if df_lines is not None else pd.DataFrame()
-    if df.empty:
-        df = pd.DataFrame(columns=headers)
-
-    # ensure columns exist
+    df = df_lines.copy() if df_lines is not None else pd.DataFrame(columns=headers)
     for col in headers:
         if col not in df.columns:
             df[col] = ""
 
-    # leave Packages & Charged blank on print (forced)
+    # Always print these blank
     df["Packages"] = ""
     df["Charged"] = ""
 
-    # Add extra blank rows for handwriting
-    blanks = pd.DataFrame([{h: "" for h in headers} for _ in range(extra_blank_rows)])
+    # Add handwriting blank lines
+    blanks = pd.DataFrame([{h: "" for h in headers} for _ in range(int(extra_blank_rows))])
     df = pd.concat([df, blanks], ignore_index=True)
 
+    # Fill to page if needed
     if fill_page_with_blanks and len(df) < max_rows:
         more = max_rows - len(df)
         df = pd.concat([df, pd.DataFrame([{h: "" for h in headers} for _ in range(more)])], ignore_index=True)
 
-    # We may need multiple pages if too many rows
-    rows = df.to_dict("records")
+    # HARD CAP: single page only
+    rows = df.to_dict("records")[:max_rows]
 
-    def draw_page(page_rows: list[dict], page_no: int):
-        nonlocal c
+    # Header band
+    c.setStrokeGray(0.70)
+    c.setFillGray(0.92)
+    c.rect(table_left, table_top - header_h, table_w, header_h, stroke=1, fill=1)
 
-        # Header band
-        c.setStrokeGray(0.70)
-        c.setFillGray(0.92)
-        c.rect(table_left, table_top - header_h, table_w, header_h, stroke=1, fill=1)
+    c.setFillGray(0.0)
+    c.setFont("Helvetica-Bold", fs_header)
 
-        c.setFillGray(0.0)
-        c.setFont("Helvetica-Bold", fs_header)
+    x = table_left
+    for i, htxt in enumerate(headers):
+        c.drawString(x + 4, table_top - header_h + 8, htxt)
+        x += col_w[i]
 
-        x = table_left
-        for i, htxt in enumerate(headers):
-            c.drawString(x + 4, table_top - header_h + 8, htxt)
+    # Vertical lines
+    x = table_left
+    for i in range(len(col_w) + 1):
+        c.line(x, table_top, x, bottom)
+        if i < len(col_w):
             x += col_w[i]
 
-        # Vertical lines
-        x = table_left
-        for i in range(len(col_w) + 1):
-            c.line(x, table_top, x, bottom)
-            if i < len(col_w):
-                x += col_w[i]
+    # Body rows (lined)
+    c.setFont("Helvetica", fs_body)
+    y = table_top - header_h
 
-        # Body rows
-        c.setFont(font_name, fs_body)
-        y = table_top - header_h
-
-        for r in page_rows:
-            # row box lines
-            c.line(table_left, y, table_right, y)
-            c.line(table_left, y - row_h, table_right, y - row_h)
-
-            # cell text (single line truncated)
-            x = table_left
-            for ci, key in enumerate(headers):
-                val = "" if r.get(key) is None else str(r.get(key))
-                # force packages/charged blank already, but keep safe
-                if key in ["Packages", "Charged"]:
-                    val = ""
-                max_w = col_w[ci] - 8
-                c.drawString(x + 4, y - 0.20 * inch, truncate_to_width(val, max_w, font_name, fs_body))
-                x += col_w[ci]
-
-            y -= row_h
-
-        # bottom border
+    for r in rows:
         c.line(table_left, y, table_right, y)
+        c.line(table_left, y - row_h, table_right, y - row_h)
 
-        # tiny footer page number if multi page
-        c.setFont("Helvetica", 8)
-        c.drawRightString(right, bottom - 0.10 * inch, f"Page {page_no}")
+        x = table_left
+        for ci, key in enumerate(headers):
+            val = "" if r.get(key) is None else str(r.get(key))
+            if key in ["Packages", "Charged"]:
+                val = ""
+            max_w = col_w[ci] - 8
+            c.drawString(x + 4, y - 0.20 * inch, truncate_to_width(val, max_w, "Helvetica", fs_body))
+            x += col_w[ci]
 
-    # paginate
-    page_no = 1
-    idx = 0
-    per_page = max_rows
-    while idx < len(rows):
-        page_rows = rows[idx : idx + per_page]
-        draw_page(page_rows, page_no)
-        idx += per_page
-        page_no += 1
-        if idx < len(rows):
-            c.showPage()
-            # redraw title on new page
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(left, top - 0.15 * inch, title)
-            c.setFont("Helvetica", 9)
-            c.drawString(left, top - 0.40 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            # (table_top stays same)
+        y -= row_h
+
+    # bottom border line
+    c.line(table_left, y, table_right, y)
 
     c.showPage()
     c.save()
@@ -406,12 +377,11 @@ def make_daily_pdf_grid(
 # =========================
 # UI
 # =========================
-st.title("Daily Delivery Sheet (BP + RX)")
-st.caption("Auto-fill BP deliveries for a date, then add RX/extra deliveries manually. PDF prints with blank lined rows.")
+st.title("SDM DELIVERY SHEET LOG")
 
 patients_df = read_patients()
 
-c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.0, 1.2])
+c1, c2, c3, c4 = st.columns([1.2, 1.1, 1.0, 1.2])
 with c1:
     dpick = st.date_input("Delivery date", value=date.today())
 with c2:
@@ -419,7 +389,7 @@ with c2:
 with c3:
     paper = st.selectbox("Paper", ["letter", "legal"], index=0)
 with c4:
-    extra_lines = st.number_input("Extra blank lines", min_value=0, max_value=60, value=12, step=1)
+    extra_lines = st.number_input("Extra blank lined rows", min_value=0, max_value=60, value=12, step=1)
 
 fill_page = st.toggle("Fill page with blank lines", value=True)
 
@@ -428,7 +398,7 @@ items = build_day_bp_list(dpick, patients_df)
 ov = read_overrides_for_day(dpick)
 items = apply_overrides_to_day(items, ov)
 
-# Filter scope
+# Filter by scope
 def allow(it: DeliveryItem, scope: str) -> bool:
     if scope == "Weekly":
         return it.interval_weeks in {1, 99}
@@ -438,12 +408,14 @@ def allow(it: DeliveryItem, scope: str) -> bool:
 
 items = [it for it in items if allow(it, scope)]
 
-# Lookup address/notes for auto-fill lines (Packages/Charged intentionally NOT filled)
+# Name lookup for address/notes
 by_name = {}
 if not patients_df.empty:
     for _, r in patients_df.iterrows():
         by_name[str(r["name"])] = r
 
+# Build table rows:
+# Type column must be: 1 BP / 2 BP / 4 BP / RX
 rows = []
 for it in items:
     r = by_name.get(it.name, None)
@@ -452,33 +424,37 @@ for it in items:
     if it.override_note:
         notes = (notes + " | " + it.override_note).strip(" |")
 
+    bp_type = f"{int(it.packs)} BP"  # <-- EXACTLY what you asked
     rows.append(
         {
-            "Type": "BP",
-            "BP": str(it.packs),
+            "Type": bp_type,
             "Patient": it.name,
             "Address": addr,
             "Notes": notes,
-            "Packages": "",  # leave blank for handwriting
-            "Charged": "",   # leave blank for handwriting
+            "Packages": "",  # print blank
+            "Charged": "",   # print blank
         }
     )
 
-# Add a few default manual rows (RX) so you don't start from empty
-for _ in range(6):
-    rows.append({"Type": "RX", "BP": "", "Patient": "", "Address": "", "Notes": "", "Packages": "", "Charged": ""})
+# Add a few default RX lines so you can type before printing
+for _ in range(8):
+    rows.append({"Type": "RX", "Patient": "", "Address": "", "Notes": "", "Packages": "", "Charged": ""})
 
-df_lines = pd.DataFrame(rows, columns=["Type", "BP", "Patient", "Address", "Notes", "Packages", "Charged"])
+df_lines = pd.DataFrame(rows, columns=["Type", "Patient", "Address", "Notes", "Packages", "Charged"])
 
-st.subheader(f"Editable daily list — {dpick.isoformat()} ({scope})")
+st.subheader(f"{dpick.strftime('%A')} — {dpick.isoformat()} ({scope})")
+
 edited = st.data_editor(
     df_lines,
     use_container_width=True,
     num_rows="dynamic",
     hide_index=True,
     column_config={
-        "Type": st.column_config.SelectboxColumn("Type", options=["BP", "RX"], required=False),
-        "BP": st.column_config.TextColumn("BP", help="For BP packs, or leave blank for RX."),
+        "Type": st.column_config.SelectboxColumn(
+            "Type",
+            options=["1 BP", "2 BP", "4 BP", "RX"],
+            required=False
+        ),
         "Patient": st.column_config.TextColumn("Patient"),
         "Address": st.column_config.TextColumn("Address"),
         "Notes": st.column_config.TextColumn("Notes"),
@@ -487,20 +463,20 @@ edited = st.data_editor(
     },
 )
 
-st.caption("Packages + Charged will print BLANK so you can fill by pen.")
+st.caption("Packages + Charged will PRINT BLANK so you can fill by pen.")
 
-pdf_bytes = make_daily_pdf_grid(
+pdf_bytes = make_daily_pdf_one_sheet(
     delivery_date=dpick,
     df_lines=edited,
     page_mode=paper,
-    fill_page_with_blanks=fill_page,
     extra_blank_rows=int(extra_lines),
+    fill_page_with_blanks=fill_page,
 )
 
 st.download_button(
-    "Download Daily PDF (lined + manual space)",
+    "Download Daily PDF (ONE SHEET)",
     data=pdf_bytes,
-    file_name=f"daily_delivery_{dpick.isoformat()}.pdf",
+    file_name=f"sdm_delivery_sheet_{dpick.isoformat()}.pdf",
     mime="application/pdf",
     type="primary",
 )
