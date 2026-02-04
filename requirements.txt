@@ -5,3 +5,4 @@ pytesseract
 streamlit-autorefresh
 reportlab
 openpyxl
+tzdata
