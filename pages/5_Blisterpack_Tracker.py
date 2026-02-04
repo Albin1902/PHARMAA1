@@ -1,7 +1,7 @@
 import os
-import io
 import sqlite3
 import calendar
+import html
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -21,39 +21,43 @@ from reportlab.pdfbase import pdfmetrics
 st.set_page_config(page_title="Blister Pack Delivery Sheet", layout="wide")
 
 PIN_VALUE = str(st.secrets.get("BP_PIN", "2026"))
+TZ_NAME = str(st.secrets.get("BP_TZ", "America/Toronto"))  # ✅ fixes "wrong time"
+try:
+    TZ = ZoneInfo(TZ_NAME)
+except Exception:
+    TZ = ZoneInfo("UTC")
 
-if "bp_unlocked" not in st.session_state:
-    st.session_state.bp_unlocked = False
 
-# Timezone for "Generated:" stamps (fixes wrong time)
-DEFAULT_TZ = str(st.secrets.get("BP_TZ", "UTC"))
-if "bp_tz" not in st.session_state:
-    st.session_state.bp_tz = DEFAULT_TZ
+def now_local() -> datetime:
+    return datetime.now(TZ)
 
-with st.sidebar:
-    st.markdown("### 🔒 Blisterpack Tracker Lock")
-    pin_in = st.text_input("Enter PIN", type="password", placeholder="PIN")
-    c_unlock, c_lock = st.columns(2)
-    if c_unlock.button("Unlock", use_container_width=True):
-        if pin_in == PIN_VALUE:
-            st.session_state.bp_unlocked = True
-            st.success("Unlocked.")
-        else:
-            st.session_state.bp_unlocked = False
-            st.error("Wrong PIN.")
-    if c_lock.button("Lock", use_container_width=True):
+
+def require_pin():
+    if "bp_unlocked" not in st.session_state:
         st.session_state.bp_unlocked = False
-        st.info("Locked.")
 
-    st.divider()
-    st.markdown("### 🕒 Timezone (for PDF stamp)")
-    st.session_state.bp_tz = st.text_input("Timezone", value=st.session_state.bp_tz, help="Example: America/Toronto, America/New_York, UTC")
-    st.caption("Streamlit Cloud runs in UTC. Set your timezone here so the PDF time matches your local time.")
+    with st.sidebar:
+        st.markdown("### 🔒 Blisterpack Tracker Lock")
+        pin_in = st.text_input("Enter PIN", type="password", placeholder="PIN")
+        c_unlock, c_lock = st.columns(2)
+        if c_unlock.button("Unlock", use_container_width=True):
+            if pin_in == PIN_VALUE:
+                st.session_state.bp_unlocked = True
+                st.success("Unlocked.")
+            else:
+                st.session_state.bp_unlocked = False
+                st.error("Wrong PIN.")
+        if c_lock.button("Lock", use_container_width=True):
+            st.session_state.bp_unlocked = False
+            st.info("Locked.")
 
-if not st.session_state.bp_unlocked:
-    st.title("Blister Pack Delivery Sheet (Auto Month Generator)")
-    st.warning("Locked. Enter PIN to access this page.", icon="🔒")
-    st.stop()
+    if not st.session_state.bp_unlocked:
+        st.title("Blister Pack Delivery Sheet (Auto Month Generator)")
+        st.warning("Locked. Enter PIN to access this page.", icon="🔒")
+        st.stop()
+
+
+require_pin()
 
 
 # =========================
@@ -65,9 +69,8 @@ st.caption(
     "Weekdays only for auto-schedule. Use Overrides for holidays/exceptions."
 )
 
-
 # =========================
-# SQLite setup (KEEP SAME DB PATH)
+# SQLite setup  (KEEP SAME DB PATH so data doesn't vanish)
 # =========================
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "blisterpacks.db")
@@ -78,17 +81,26 @@ def conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
+def safe_add_column(c: sqlite3.Connection, table: str, col_def: str):
+    # col_def example: "address TEXT DEFAULT ''"
+    try:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+    except Exception:
+        pass
+
+
 def init_db():
     with conn() as c:
+        # patients
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS bp_patients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                address TEXT,
+                address TEXT DEFAULT '',
                 weekday INTEGER NOT NULL,                -- 0=Mon ... 6=Sun
-                interval_weeks INTEGER NOT NULL,         -- 1 / 2 / 4 (Weekly / Biweekly / Monthly-4wk)
-                packs_per_delivery INTEGER NOT NULL,     -- usually matches interval (1/2/4)
+                interval_weeks INTEGER NOT NULL,         -- 1 / 2 / 4
+                packs_per_delivery INTEGER NOT NULL,     -- usually 1/2/4
                 anchor_date TEXT NOT NULL,               -- ISO yyyy-mm-dd
                 notes TEXT,
                 active INTEGER NOT NULL DEFAULT 1
@@ -96,6 +108,10 @@ def init_db():
             """
         )
 
+        # schema migrations if older DB exists (no data loss)
+        safe_add_column(c, "bp_patients", "address TEXT DEFAULT ''")
+
+        # overrides
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS bp_overrides (
@@ -109,15 +125,6 @@ def init_db():
             """
         )
 
-        # migrations (in case your old table was missing columns)
-        cols = [r[1] for r in c.execute("PRAGMA table_info(bp_patients)").fetchall()]
-        if "address" not in cols:
-            c.execute("ALTER TABLE bp_patients ADD COLUMN address TEXT")
-        if "notes" not in cols:
-            c.execute("ALTER TABLE bp_patients ADD COLUMN notes TEXT")
-        if "active" not in cols:
-            c.execute("ALTER TABLE bp_patients ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-
         c.execute("CREATE INDEX IF NOT EXISTS idx_bp_patients_weekday ON bp_patients(weekday)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bp_overrides_date ON bp_overrides(odate)")
         c.commit()
@@ -127,16 +134,8 @@ init_db()
 
 WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 SUN_FIRST = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
 FREQ_LABEL = {1: "Weekly", 2: "Biweekly", 4: "Monthly"}
 LABEL_TO_FREQ = {"Weekly": 1, "Biweekly": 2, "Monthly": 4}
-
-
-def now_local() -> datetime:
-    try:
-        return datetime.now(ZoneInfo(st.session_state.bp_tz))
-    except Exception:
-        return datetime.now(ZoneInfo("UTC"))
 
 
 # =========================
@@ -154,40 +153,66 @@ def read_patients() -> pd.DataFrame:
         )
     if df.empty:
         return df
-    df["anchor_date"] = pd.to_datetime(df["anchor_date"]).dt.date
+    df["anchor_date"] = pd.to_datetime(df["anchor_date"], errors="coerce").dt.date
     df["active"] = df["active"].astype(bool)
     df["address"] = df["address"].fillna("")
     df["notes"] = df["notes"].fillna("")
     return df
 
 
+def insert_patient(
+    name: str,
+    address: str,
+    weekday: int,
+    interval_weeks: int,
+    packs_per_delivery: int,
+    anchor_date: date,
+    notes: str,
+    active: bool,
+):
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO bp_patients (name, address, weekday, interval_weeks, packs_per_delivery, anchor_date, notes, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name.strip(),
+                (address or "").strip(),
+                int(weekday),
+                int(interval_weeks),
+                int(packs_per_delivery),
+                anchor_date.isoformat(),
+                (notes or "").strip(),
+                1 if active else 0,
+            ),
+        )
+        c.commit()
+
+
 def upsert_patients(df: pd.DataFrame):
-    """
-    FIXED: If CSV has IDs but table is empty, UPDATE will affect 0 rows.
-    We now INSERT when UPDATE rowcount == 0.
-    """
     with conn() as c:
         for _, r in df.iterrows():
             rid = r.get("id", None)
             name = str(r.get("name", "")).strip()
+            if not name:
+                continue
+
             address = "" if pd.isna(r.get("address", "")) else str(r.get("address", "")).strip()
             weekday = int(r.get("weekday", 0))
             interval = int(r.get("interval_weeks", 1))
             packs = int(r.get("packs_per_delivery", interval))
-            anchor = r.get("anchor_date", date.today())
 
+            anchor = r.get("anchor_date", None)
             if isinstance(anchor, pd.Timestamp):
                 anchor = anchor.date()
             if not isinstance(anchor, date):
-                anchor = pd.to_datetime(anchor).date()
+                anchor = pd.to_datetime(anchor, errors="coerce")
+                anchor = anchor.date() if pd.notna(anchor) else date.today()
 
             notes = "" if pd.isna(r.get("notes", "")) else str(r.get("notes", "")).strip()
             active = 1 if bool(r.get("active", True)) else 0
 
-            if not name:
-                continue
-
-            # If id missing => INSERT
             if pd.isna(rid) or rid is None:
                 c.execute(
                     """
@@ -196,53 +221,16 @@ def upsert_patients(df: pd.DataFrame):
                     """,
                     (name, address, weekday, interval, packs, anchor.isoformat(), notes, active),
                 )
-                continue
-
-            # Try UPDATE first
-            cur = c.execute(
-                """
-                UPDATE bp_patients
-                SET name=?, address=?, weekday=?, interval_weeks=?, packs_per_delivery=?, anchor_date=?, notes=?, active=?
-                WHERE id=?
-                """,
-                (name, address, weekday, interval, packs, anchor.isoformat(), notes, active, int(rid)),
-            )
-
-            # If nothing updated, INSERT with this id (restore after wipe)
-            if cur.rowcount == 0:
+            else:
                 c.execute(
                     """
-                    INSERT INTO bp_patients (id, name, address, weekday, interval_weeks, packs_per_delivery, anchor_date, notes, active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    UPDATE bp_patients
+                    SET name=?, address=?, weekday=?, interval_weeks=?, packs_per_delivery=?, anchor_date=?, notes=?, active=?
+                    WHERE id=?
                     """,
-                    (int(rid), name, address, weekday, interval, packs, anchor.isoformat(), notes, active),
+                    (name, address, weekday, interval, packs, anchor.isoformat(), notes, active, int(rid)),
                 )
-
         c.commit()
-
-
-def add_patient(
-    name: str,
-    address: str,
-    weekday: int,
-    interval_weeks: int,
-    packs_per_delivery: int,
-    anchor_date: date,
-    notes: str,
-    active: bool = True,
-):
-    df = pd.DataFrame([{
-        "id": None,
-        "name": name,
-        "address": address,
-        "weekday": weekday,
-        "interval_weeks": interval_weeks,
-        "packs_per_delivery": packs_per_delivery,
-        "anchor_date": anchor_date,
-        "notes": notes,
-        "active": active,
-    }])
-    upsert_patients(df)
 
 
 def delete_patient_by_id(pid: int):
@@ -272,7 +260,7 @@ def read_overrides(month_start: date, month_end: date) -> pd.DataFrame:
         )
     if df.empty:
         return df
-    df["odate"] = pd.to_datetime(df["odate"]).dt.date
+    df["odate"] = pd.to_datetime(df["odate"], errors="coerce").dt.date
     df["note"] = df["note"].fillna("")
     return df
 
@@ -284,7 +272,7 @@ def add_override(odate: date, patient_name: str, action: str, packs: int | None,
             INSERT INTO bp_overrides (odate, patient_name, action, packs, note)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (odate.isoformat(), patient_name.strip(), action.strip(), packs, note.strip()),
+            (odate.isoformat(), patient_name.strip(), action.strip(), packs, (note or "").strip()),
         )
         c.commit()
 
@@ -308,11 +296,18 @@ def dates_in_month(year: int, month: int) -> list[date]:
     return out
 
 
+def normalize_anchor_to_weekday(anchor: date, weekday: int) -> date:
+    """
+    ✅ fixes 'import worked but calendar dates are wrong' issue.
+    If anchor date doesn't match selected weekday, push forward to next matching weekday.
+    """
+    if anchor.weekday() == weekday:
+        return anchor
+    delta = (weekday - anchor.weekday()) % 7
+    return anchor + timedelta(days=delta)
+
+
 def occurs_on_day(anchor: date, interval_weeks: int, d: date) -> bool:
-    """
-    anchor_date is the first delivery date in the cycle.
-    The delivery repeats every interval_weeks on the SAME weekday (you also store weekday).
-    """
     if d < anchor:
         return False
     delta_days = (d - anchor).days
@@ -325,6 +320,8 @@ class DeliveryItem:
     name: str
     packs: int
     interval_weeks: int  # 1 weekly, 2 biweekly, 4 monthly, 99 manual add
+    note: str = ""
+    address: str = ""
 
 
 def build_month_schedule(year: int, month: int, patients_df: pd.DataFrame) -> dict[date, list[DeliveryItem]]:
@@ -337,7 +334,7 @@ def build_month_schedule(year: int, month: int, patients_df: pd.DataFrame) -> di
         return schedule
 
     for d in list(schedule.keys()):
-        # Auto schedule = weekdays only
+        # Auto schedule weekdays only
         if d.weekday() > 4:
             continue
 
@@ -346,10 +343,20 @@ def build_month_schedule(year: int, month: int, patients_df: pd.DataFrame) -> di
             continue
 
         for _, r in todays.iterrows():
-            anchor = r["anchor_date"]
-            if isinstance(anchor, pd.Timestamp):
-                anchor = anchor.date()
+            raw_anchor = r["anchor_date"]
+            if isinstance(raw_anchor, pd.Timestamp):
+                raw_anchor = raw_anchor.date()
+            if not isinstance(raw_anchor, date):
+                raw_anchor = pd.to_datetime(raw_anchor, errors="coerce")
+                raw_anchor = raw_anchor.date() if pd.notna(raw_anchor) else d
+
             interval = int(r["interval_weeks"])
+            weekday = int(r["weekday"])
+
+            anchor = normalize_anchor_to_weekday(raw_anchor, weekday)
+
+            pt_note = "" if pd.isna(r.get("notes", "")) else str(r.get("notes", "")).strip()
+            pt_addr = "" if pd.isna(r.get("address", "")) else str(r.get("address", "")).strip()
 
             if occurs_on_day(anchor, interval, d):
                 schedule[d].append(
@@ -357,9 +364,12 @@ def build_month_schedule(year: int, month: int, patients_df: pd.DataFrame) -> di
                         name=str(r["name"]),
                         packs=int(r["packs_per_delivery"]),
                         interval_weeks=interval,
+                        note=pt_note,
+                        address=pt_addr,
                     )
                 )
 
+        # Sort: weekly → biweekly → monthly → manual
         schedule[d].sort(key=lambda x: (x.interval_weeks, x.name.lower()))
     return schedule
 
@@ -373,6 +383,7 @@ def apply_overrides(schedule: dict[date, list[DeliveryItem]], overrides_df: pd.D
         name = str(r["patient_name"])
         action = str(r["action"]).lower().strip()
         packs = None if pd.isna(r.get("packs", None)) else int(r["packs"])
+        onote = "" if pd.isna(r.get("note", "")) else str(r.get("note", "")).strip()
 
         if d not in schedule:
             continue
@@ -380,19 +391,13 @@ def apply_overrides(schedule: dict[date, list[DeliveryItem]], overrides_df: pd.D
         if action == "skip":
             schedule[d] = [x for x in schedule[d] if x.name != name]
         elif action == "add":
-            schedule[d].append(DeliveryItem(name=name, packs=packs or 1, interval_weeks=99))
+            schedule[d].append(DeliveryItem(name=name, packs=packs or 1, interval_weeks=99, note=onote))
             schedule[d].sort(key=lambda x: (x.interval_weeks, x.name.lower()))
 
     return schedule
 
 
 def filter_schedule(schedule: dict[date, list[DeliveryItem]], mode: str) -> dict[date, list[DeliveryItem]]:
-    """
-    mode:
-      - "Weekly" -> {1} + manual 99
-      - "Biweekly + Monthly" -> {2,4} + manual 99
-      - "All" -> {1,2,4} + manual 99
-    """
     if mode == "Weekly":
         allowed = {1, 99}
     elif mode == "Biweekly + Monthly":
@@ -408,7 +413,7 @@ def filter_schedule(schedule: dict[date, list[DeliveryItem]], mode: str) -> dict
 
 
 # =========================
-# PDF helpers (month one-page)
+# PDF helpers
 # =========================
 def truncate_to_width(text: str, max_width: float, font_name: str, font_size: int) -> str:
     if pdfmetrics.stringWidth(text, font_name, font_size) <= max_width:
@@ -418,6 +423,7 @@ def truncate_to_width(text: str, max_width: float, font_name: str, font_size: in
     if ell_w >= max_width:
         return ell
     avail = max_width - ell_w
+
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -433,7 +439,7 @@ def make_month_pdf_one_page(
     year: int,
     month: int,
     schedule: dict[date, list[DeliveryItem]],
-    page_mode: str = "letter",        # "letter" or "legal"
+    page_mode: str = "letter",
     min_font: int = 3,
     allow_two_columns: bool = True,
 ) -> bytes:
@@ -448,12 +454,10 @@ def make_month_pdf_one_page(
     bottom = margin
     top = h - margin
 
-    stamp = now_local().strftime("%Y-%m-%d %H:%M")
-
     c.setFont("Helvetica-Bold", 14)
     c.drawString(left, top - 0.12 * inch, f"Blister Pack Delivery Sheet — {calendar.month_name[month]} {year}")
     c.setFont("Helvetica", 9)
-    c.drawString(left, top - 0.30 * inch, f"Generated: {stamp}")
+    c.drawString(left, top - 0.30 * inch, f"Generated: {now_local().strftime('%Y-%m-%d %H:%M')}  ({TZ_NAME})")
 
     grid_top = top - 0.45 * inch
     grid_bottom = bottom
@@ -462,13 +466,13 @@ def make_month_pdf_one_page(
 
     grid_w = grid_right - grid_left
     grid_h = grid_top - grid_bottom
-
     col_w = grid_w / 7.0
+
     header_h = 0.22 * inch
     body_h = grid_h - header_h
 
-    cal = calendar.Calendar(firstweekday=6)  # Sunday first
-    weeks = cal.monthdatescalendar(year, month)
+    calx = calendar.Calendar(firstweekday=6)
+    weeks = calx.monthdatescalendar(year, month)
     rows = len(weeks)
     row_h = body_h / rows
 
@@ -498,7 +502,7 @@ def make_month_pdf_one_page(
             c.setStrokeGray(0.65)
             c.line(x0, y_bot, x0, y_top)
 
-            # ✅ No extra-month dates printed
+            # Only selected month; other month cells blank
             if d.month != month:
                 continue
 
@@ -518,10 +522,25 @@ def make_month_pdf_one_page(
             if area_h <= 0:
                 continue
 
-            entries = [f"{it.name} ({it.packs}p)" for it in items]
+            # ✅ show notes if present (otherwise blank)
+            entries = []
+            for it in items:
+                s = f"{it.name} ({it.packs}p)"
+                if getattr(it, "note", ""):
+                    s = f"{s} — {it.note}"
+                entries.append(s)
 
-            def max_lines_for_fs(fs: int) -> int:
-                return int(area_h // (fs + 0.5))
+            def fits_single(fs: int) -> tuple[bool, int]:
+                line_h = fs + 0.5
+                max_lines = int(area_h // line_h)
+                return (len(entries) <= max_lines, max_lines)
+
+            def fits_two(fs: int) -> tuple[bool, int]:
+                if not allow_two_columns:
+                    return (False, 0)
+                line_h = fs + 0.5
+                max_lines = int(area_h // line_h)
+                return (len(entries) <= max_lines * 2, max_lines)
 
             chosen_mode = None
             chosen_fs = None
@@ -530,29 +549,25 @@ def make_month_pdf_one_page(
             for fs in [8, 7, 6, 5, 4, 3]:
                 if fs < min_font:
                     continue
-                max_lines = max_lines_for_fs(fs)
-                if max_lines <= 0:
-                    continue
-                if len(entries) <= max_lines:
+                ok, max_lines = fits_single(fs)
+                if ok and max_lines > 0:
                     chosen_mode, chosen_fs, chosen_max_lines = "single", fs, max_lines
                     break
 
-            if chosen_mode is None and allow_two_columns:
+            if chosen_mode is None:
                 for fs in [7, 6, 5, 4, 3]:
                     if fs < min_font:
                         continue
-                    max_lines = max_lines_for_fs(fs)
-                    if max_lines <= 0:
-                        continue
-                    if len(entries) <= max_lines * 2:
+                    ok, max_lines = fits_two(fs)
+                    if ok and max_lines > 0:
                         chosen_mode, chosen_fs, chosen_max_lines = "two", fs, max_lines
                         break
 
             if chosen_mode is None:
                 chosen_mode = "two" if allow_two_columns else "single"
                 chosen_fs = min_font
-                chosen_max_lines = max_lines_for_fs(chosen_fs)
-                if chosen_max_lines <= 0:
+                chosen_max_lines = int(area_h // (chosen_fs + 0.5))
+                if chosen_max_lines < 1:
                     continue
 
             fs = chosen_fs
@@ -570,8 +585,8 @@ def make_month_pdf_one_page(
 
                 y = area_top - fs
                 for i, e in enumerate(to_print):
-                    c.drawString(x0 + pad_x, y - i * line_h, truncate_to_width(e, max_w, font_name, fs))
-
+                    line = truncate_to_width(e, max_w, font_name, fs)
+                    c.drawString(x0 + pad_x, y - i * line_h, line)
             else:
                 gap = 6
                 half_w = (col_w - 2 * pad_x - gap) / 2.0
@@ -610,41 +625,144 @@ def make_month_pdf_one_page(
     return data
 
 
+def wrap_text_to_width(text: str, max_width: float, font_name: str, font_size: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    cur = words[0]
+    for w in words[1:]:
+        cand = cur + " " + w
+        if pdfmetrics.stringWidth(cand, font_name, font_size) <= max_width:
+            cur = cand
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    return lines
+
+
+def make_week_pdf(week_start: date, schedule: dict[date, list[DeliveryItem]], page_mode: str = "letter") -> bytes:
+    pagesize = landscape(letter if page_mode == "letter" else legal)
+    w, h = pagesize
+    tmp_path = os.path.join(DATA_DIR, "_tmp_week.pdf")
+
+    c = canvas.Canvas(tmp_path, pagesize=pagesize)
+    week_end = week_start + timedelta(days=6)
+
+    title = f"Blister Pack — Weekly Delivery Sheet ({week_start.isoformat()} to {week_end.isoformat()})"
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(0.5 * inch, h - 0.55 * inch, title)
+
+    c.setFont("Helvetica", 9)
+    c.drawString(0.5 * inch, h - 0.8 * inch, f"Generated: {now_local().strftime('%Y-%m-%d %H:%M')}  ({TZ_NAME})")
+
+    left = 0.5 * inch
+    right = w - 0.5 * inch
+    top = h - 1.05 * inch
+    bottom = 0.5 * inch
+
+    col_day = 2.2 * inch
+    row_h = (top - bottom) / 8.0
+
+    c.setFillGray(0.92)
+    c.rect(left, top - row_h, right - left, row_h, stroke=0, fill=1)
+    c.setFillGray(0.0)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(left + 6, top - row_h + 8, "Day")
+    c.drawString(left + col_day + 6, top - row_h + 8, "Due (Weekly → Biweekly → Monthly)   [ ] Delivered   Notes")
+
+    y = top - row_h
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        y2 = y - row_h
+
+        c.setStrokeGray(0.75)
+        c.line(left, y, right, y)
+        c.line(left, y2, right, y2)
+        c.line(left, y2, left, y)
+        c.line(left + col_day, y2, left + col_day, y)
+        c.line(right, y2, right, y)
+
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(left + 6, y2 + row_h - 14, f"{WEEKDAY_LABELS[d.weekday()]} {d.isoformat()}")
+
+        items = schedule.get(d, [])
+        items = sorted(items, key=lambda x: (x.interval_weeks, x.name.lower()))
+
+        c.setFont("Helvetica", 9)
+        yy = y2 + row_h - 30
+        line_h = 11
+        max_w = (right - left - col_day - 16)
+
+        for it in items:
+            line = f"{it.name} ({it.packs}p)"
+            if getattr(it, "note", ""):
+                line = f"{line} — {it.note}"
+            wrapped = wrap_text_to_width(line, max_w, "Helvetica", 9)
+            for wline in wrapped:
+                c.drawString(left + col_day + 10, yy, wline)
+                yy -= line_h
+                if yy < y2 + 6:
+                    break
+            if yy < y2 + 6:
+                break
+
+        y = y2
+
+    c.showPage()
+    c.save()
+
+    with open(tmp_path, "rb") as f:
+        data = f.read()
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+    return data
+
+
 # =========================
-# Import/Export helpers
+# Import / Export helpers
 # =========================
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def export_patients_csv_bytes() -> bytes:
+    df = read_patients()
+    if df.empty:
+        df = pd.DataFrame(columns=["id", "name", "address", "weekday", "interval_weeks", "packs_per_delivery", "anchor_date", "notes", "active"])
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def import_patients_df(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        # requires openpyxl
+        df = pd.read_excel(uploaded_file)
+    else:
+        raise ValueError("Upload .csv or .xlsx")
+
+    # normalize column names
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # common aliases
-    rename_map = {
+    # alias mapping
+    aliases = {
         "patient": "name",
         "patient_name": "name",
-        "interval_week": "interval_weeks",
+        "weekd": "weekday",
+        "interval_wee": "interval_weeks",
+        "packs_per_deliv": "packs_per_delivery",
         "packs": "packs_per_delivery",
-        "packs_per_deliver": "packs_per_delivery",
         "anchor": "anchor_date",
     }
-    for k, v in rename_map.items():
-        if k in df.columns and v not in df.columns:
-            df.rename(columns={k: v}, inplace=True)
+    for a, b in aliases.items():
+        if a in df.columns and b not in df.columns:
+            df[b] = df[a]
 
-    # drop editor-only columns
-    for junk in ["__delete__", "_delete__", "delete"]:
-        if junk in df.columns:
-            df.drop(columns=[junk], inplace=True, errors="ignore")
-
-    return df
-
-
-def coerce_import_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
-
-    needed = ["name", "weekday", "interval_weeks", "anchor_date"]
-    for n in needed:
-        if n not in df.columns:
-            raise ValueError(f"Missing column: {n}")
+    required = ["name", "weekday", "interval_weeks", "anchor_date"]
+    for r in required:
+        if r not in df.columns:
+            raise ValueError(f"Missing column: {r}")
 
     if "packs_per_delivery" not in df.columns:
         df["packs_per_delivery"] = df["interval_weeks"]
@@ -652,55 +770,40 @@ def coerce_import_df(df: pd.DataFrame) -> pd.DataFrame:
     if "active" not in df.columns:
         df["active"] = True
 
-    if "address" not in df.columns:
-        df["address"] = ""
-
     if "notes" not in df.columns:
         df["notes"] = ""
 
+    if "address" not in df.columns:
+        df["address"] = ""
+
     if "id" not in df.columns:
-        df["id"] = None
+        df["id"] = pd.NA
 
-    out = df[["id", "name", "address", "weekday", "interval_weeks", "packs_per_delivery", "anchor_date", "notes", "active"]].copy()
+    df["weekday"] = pd.to_numeric(df["weekday"], errors="coerce").fillna(0).astype(int)
+    df["interval_weeks"] = pd.to_numeric(df["interval_weeks"], errors="coerce").fillna(1).astype(int)
+    df["packs_per_delivery"] = pd.to_numeric(df["packs_per_delivery"], errors="coerce").fillna(df["interval_weeks"]).astype(int)
 
-    # types
-    out["name"] = out["name"].astype(str).str.strip()
-    out["address"] = out["address"].fillna("").astype(str)
-    out["notes"] = out["notes"].fillna("").astype(str)
+    # parse date
+    df["anchor_date"] = pd.to_datetime(df["anchor_date"], errors="coerce").dt.date
+    df["anchor_date"] = df["anchor_date"].fillna(date.today())
 
-    out["weekday"] = pd.to_numeric(out["weekday"], errors="coerce").fillna(0).astype(int)
-    out["interval_weeks"] = pd.to_numeric(out["interval_weeks"], errors="coerce").fillna(1).astype(int)
-    out["packs_per_delivery"] = pd.to_numeric(out["packs_per_delivery"], errors="coerce").fillna(out["interval_weeks"]).astype(int)
+    # active
+    def to_bool(x):
+        if isinstance(x, bool):
+            return x
+        s = str(x).strip().lower()
+        return s in ("1", "true", "yes", "y", "t")
 
-    out["anchor_date"] = pd.to_datetime(out["anchor_date"], errors="coerce").dt.date
-    out["anchor_date"] = out["anchor_date"].fillna(date.today())
+    df["active"] = df["active"].apply(to_bool)
 
-    # active (TRUE/FALSE/1/0)
-    def to_bool(v):
-        if isinstance(v, bool):
-            return v
-        s = str(v).strip().lower()
-        return s in ("true", "1", "yes", "y", "t")
+    # clean text
+    df["name"] = df["name"].astype(str).str.strip()
+    df["notes"] = df["notes"].fillna("").astype(str)
+    df["address"] = df["address"].fillna("").astype(str)
 
-    out["active"] = out["active"].apply(to_bool)
-
-    # id
-    out["id"] = pd.to_numeric(out["id"], errors="coerce")
-
-    # sanity clamps
-    out["weekday"] = out["weekday"].clip(lower=0, upper=4)  # Mon-Fri
-    out["interval_weeks"] = out["interval_weeks"].replace({0: 1})
-    out.loc[~out["interval_weeks"].isin([1, 2, 4]), "interval_weeks"] = 1
-    out.loc[~out["packs_per_delivery"].isin([1, 2, 4]), "packs_per_delivery"] = out["interval_weeks"]
-
-    out = out[out["name"] != ""]
-    return out
-
-
-def wipe_patients():
-    with conn() as c:
-        c.execute("DELETE FROM bp_patients")
-        c.commit()
+    # keep only our columns
+    df = df[["id", "name", "address", "weekday", "interval_weeks", "packs_per_delivery", "anchor_date", "notes", "active"]]
+    return df
 
 
 # =========================
@@ -714,58 +817,80 @@ today = date.today()
 
 
 # -------------------------
-# Patients tab (Add form + table + import/export)
+# Patients tab
 # -------------------------
 with tab_patients:
     st.subheader("Patients master list (Add / Edit / Delete)")
     st.caption("Tip: Use the Add form (fast). Use the table for bulk edits & deletes.")
 
-    st.markdown("### ➕ Add new patient")
-    with st.form("add_patient_form", clear_on_submit=True):
-        c1, c2 = st.columns([1.6, 2.4])
-        with c1:
-            new_name = st.text_input("Patient name (printed)*")
-            new_weekday = st.selectbox("Delivery weekday (Mon–Fri)", options=[0, 1, 2, 3, 4], format_func=lambda x: WEEKDAY_LABELS[x], index=0)
-            new_freq_label = st.selectbox("Frequency", options=["Weekly", "Biweekly", "Monthly"], index=0)
-            new_anchor = st.date_input("Anchor date (first delivery date in cycle)", value=today)
-        with c2:
-            new_address = st.text_input("Address (optional)")
-            new_notes = st.text_input("Notes (optional)")
-            new_active = st.checkbox("Active", value=True)
+    # Quick add form (so you don't need to 'save table changes' to add)
+    with st.expander("➕ Add new patient", expanded=True):
+        with st.form("add_patient_form", clear_on_submit=True):
+            c1, c2 = st.columns([2, 1.4])
+            with c1:
+                new_name = st.text_input("Patient name (printed)*")
+            with c2:
+                new_address = st.text_input("Address (optional)")
 
-        submitted = st.form_submit_button("Add patient", use_container_width=True)
-        if submitted:
-            if not new_name.strip():
-                st.error("Name is required.")
-            else:
-                interval = LABEL_TO_FREQ[new_freq_label]
-                add_patient(
-                    name=new_name.strip(),
-                    address=new_address.strip(),
-                    weekday=int(new_weekday),
-                    interval_weeks=int(interval),
-                    packs_per_delivery=int(interval),
-                    anchor_date=new_anchor,
-                    notes=new_notes.strip(),
-                    active=bool(new_active),
-                )
-                st.success("Added.")
-                st.rerun()
+            c3, c4 = st.columns([1, 1])
+            with c3:
+                new_wd_label = st.selectbox("Delivery weekday (Mon–Fri)", ["Mon", "Tue", "Wed", "Thu", "Fri"], index=0)
+                new_weekday = WEEKDAY_LABELS.index(new_wd_label)
+            with c4:
+                new_freq_label = st.selectbox("Frequency", ["Weekly", "Biweekly", "Monthly"], index=0)
+                new_interval = LABEL_TO_FREQ[new_freq_label]
+
+            c5, c6 = st.columns([1.2, 1])
+            with c5:
+                new_anchor = st.date_input("Anchor date (first delivery date in cycle)", value=today)
+            with c6:
+                new_active = st.checkbox("Active", value=True)
+
+            new_notes = st.text_input("Notes (optional)")
+            submitted = st.form_submit_button("Add patient", use_container_width=True)
+
+            if submitted:
+                if not new_name.strip():
+                    st.error("Name is required.")
+                else:
+                    packs = new_interval  # auto packs match frequency
+                    insert_patient(
+                        name=new_name,
+                        address=new_address,
+                        weekday=new_weekday,
+                        interval_weeks=new_interval,
+                        packs_per_delivery=packs,
+                        anchor_date=new_anchor,
+                        notes=new_notes,
+                        active=new_active,
+                    )
+                    st.success("Patient added.")
+                    st.rerun()
 
     st.divider()
 
     df_all = read_patients()
     if df_all.empty:
-        df_all = pd.DataFrame(columns=["id", "name", "address", "weekday", "interval_weeks", "packs_per_delivery", "anchor_date", "notes", "active"])
+        df_all = pd.DataFrame(
+            columns=["id", "name", "address", "weekday", "interval_weeks", "packs_per_delivery", "anchor_date", "notes", "active"]
+        )
 
-    st.markdown("### 🔎 Filters")
-    f1, f2, f3, f4 = st.columns([1.5, 1.3, 1.3, 1.0])
+    # Filters
+    f1, f2, f3, f4 = st.columns([1.4, 1.1, 1.2, 1.0])
     with f1:
-        q = st.text_input("Search name / address / notes", value="")
+        q = st.text_input("Search name / notes / address", value="")
     with f2:
-        freq_pick = st.multiselect("Frequency", options=["Weekly", "Biweekly", "Monthly"], default=["Weekly", "Biweekly", "Monthly"])
+        freq_pick = st.multiselect(
+            "Frequency",
+            options=["Weekly", "Biweekly", "Monthly"],
+            default=["Weekly", "Biweekly", "Monthly"],
+        )
     with f3:
-        wd_pick = st.multiselect("Weekday", options=["Mon", "Tue", "Wed", "Thu", "Fri"], default=["Mon", "Tue", "Wed", "Thu", "Fri"])
+        wd_pick = st.multiselect(
+            "Weekday",
+            options=["Mon", "Tue", "Wed", "Thu", "Fri"],
+            default=["Mon", "Tue", "Wed", "Thu", "Fri"],
+        )
     with f4:
         active_only = st.toggle("Active only", value=False)
 
@@ -775,8 +900,8 @@ with tab_patients:
         qq = q.strip().lower()
         df_view = df_view[
             df_view["name"].astype(str).str.lower().str.contains(qq)
-            | df_view["address"].astype(str).str.lower().str.contains(qq)
             | df_view["notes"].astype(str).str.lower().str.contains(qq)
+            | df_view["address"].astype(str).str.lower().str.contains(qq)
         ]
 
     if freq_pick:
@@ -793,11 +918,10 @@ with tab_patients:
     if "__delete__" not in df_view.columns:
         df_view["__delete__"] = False
 
-    st.markdown("### 🧾 Patients table (bulk edit)")
     edited = st.data_editor(
         df_view,
         use_container_width=True,
-        num_rows="fixed",
+        num_rows="dynamic",
         column_config={
             "id": st.column_config.NumberColumn("ID", disabled=True),
             "name": st.column_config.TextColumn("Patient name (printed)", required=True),
@@ -853,48 +977,53 @@ with tab_patients:
         st.rerun()
 
     st.divider()
-    st.markdown("### ♻️ Import / Export (restore your missing data)")
+    st.subheader("Import / Export (restore your missing data)")
 
-    # Export CSV backup
-    patients_csv = read_patients().to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download patients CSV (backup)", data=patients_csv, file_name="bp_patients_backup.csv", mime="text/csv")
+    cexp1, cexp2 = st.columns([1, 1])
+    with cexp1:
+        st.download_button(
+            "⬇️ Download patients CSV (backup)",
+            data=export_patients_csv_bytes(),
+            file_name=f"bp_patients_export_{now_local().strftime('%Y-%m-%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with cexp2:
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, "rb") as f:
+                st.download_button(
+                    "⬇️ Download SQLite DB (full backup)",
+                    data=f.read(),
+                    file_name="blisterpacks.db",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
 
-    # Export DB backup
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH, "rb") as f:
-            db_bytes = f.read()
-        st.download_button("⬇️ Download SQLite DB (full backup)", data=db_bytes, file_name="blisterpacks.db", mime="application/octet-stream")
-
-    st.markdown("#### Import from CSV / Excel")
-    up = st.file_uploader("Upload a file (.csv or .xlsx)", type=["csv", "xlsx"])
-    replace = st.toggle("Replace existing patients (wipe then restore)", value=False)
+    st.markdown("### Import from CSV / Excel")
+    up = st.file_uploader("Upload your exported file (.csv or .xlsx)", type=["csv", "xlsx"])
+    replace_mode = st.toggle("Replace patients table (wipe then restore)", value=False)
+    confirm_replace = st.checkbox("Confirm replace (required)", value=False, disabled=not replace_mode)
 
     if up is not None:
         try:
-            if up.name.lower().endswith(".csv"):
-                df_in = pd.read_csv(up)
-            elif up.name.lower().endswith(".xlsx"):
-                # needs openpyxl in requirements
-                df_in = pd.read_excel(up)
-            else:
-                st.error("Unsupported file type. Use .csv or .xlsx")
-                df_in = None
+            df_imp = import_patients_df(up)
+            st.write("Preview import:")
+            st.dataframe(df_imp.head(50), use_container_width=True, hide_index=True)
 
-            if df_in is not None:
-                df_fixed = coerce_import_df(df_in)
-                st.write("Preview (first 20 rows):")
-                st.dataframe(df_fixed.head(20), use_container_width=True, hide_index=True)
-
-                if st.button("✅ Import now"):
-                    if replace:
-                        wipe_patients()
-                    upsert_patients(df_fixed)
+            if st.button("Import now", type="primary"):
+                if replace_mode and not confirm_replace:
+                    st.error("You turned on Replace. Check Confirm replace first.")
+                else:
+                    with conn() as c:
+                        if replace_mode:
+                            c.execute("DELETE FROM bp_patients")
+                            c.commit()
+                    upsert_patients(df_imp)
                     st.success("Import complete.")
                     st.rerun()
 
         except Exception as e:
             st.error(f"Import failed: {e}")
-            st.info("If you uploaded a file named like *.csv.xlsx, that is EXCEL, not CSV. Either upload a real .csv OR keep openpyxl in requirements.")
 
 
 # -------------------------
@@ -902,7 +1031,7 @@ with tab_patients:
 # -------------------------
 with tab_overrides:
     st.subheader("Overrides (manual exceptions)")
-    st.caption("skip removes, add inserts extra BP delivery (can even be on weekend if you want).")
+    st.caption("skip removes, add inserts extra delivery (even weekends).")
 
     o1, o2 = st.columns([1, 1])
     with o1:
@@ -935,7 +1064,7 @@ with tab_overrides:
         else:
             st.write("")
     with oc5:
-        note = st.text_input("Note", placeholder="e.g., holiday / patient ok pickup")
+        note = st.text_input("Note", placeholder="shows on calendar/PDF if filled")
 
     if st.button("Save override", type="primary"):
         if not pname or str(pname).strip() == "":
@@ -961,23 +1090,35 @@ with tab_overrides:
 
 
 # -------------------------
-# Calendar tab (default = Biweekly+Monthly)
+# Calendar tab (DEFAULT = Biweekly+Monthly)
 # -------------------------
 with tab_cal:
-    c1, c2 = st.columns([1, 1])
+    c1, c2, c3 = st.columns([1, 1, 1.6])
     with c1:
         year = st.number_input("Year", min_value=2020, max_value=2100, value=today.year, step=1)
     with c2:
-        month = st.selectbox("Month", list(range(1, 13)), index=today.month - 1, format_func=lambda m: calendar.month_name[m])
+        month = st.selectbox(
+            "Month",
+            list(range(1, 13)),
+            index=today.month - 1,
+            format_func=lambda m: calendar.month_name[m],
+        )
+    with c3:
+        view_mode = st.radio(
+            "View",
+            ["Biweekly + Monthly", "Weekly", "All"],
+            index=0,
+            horizontal=True,
+        )
 
     patients_df = read_patients()
     base = build_month_schedule(int(year), int(month), patients_df)
     start, end = month_bounds(int(year), int(month))
     overrides_df = read_overrides(start, end)
     schedule_all = apply_overrides(base, overrides_df)
+    schedule = filter_schedule(schedule_all, view_mode)
 
-    view_tabs = st.tabs(["Biweekly + Monthly (default)", "Weekly", "All"])
-    view_modes = ["Biweekly + Monthly", "Weekly", "All"]
+    st.subheader(f"{calendar.month_name[int(month)]} {int(year)} — {view_mode}")
 
     st.markdown(
         """
@@ -986,58 +1127,60 @@ with tab_cal:
         .bp-date { font-weight: 800; font-size: 14px; margin-bottom: 6px; }
         .bp-muted { opacity: 0.20; }
         .bp-item { font-size: 12px; line-height: 1.22; margin: 0 0 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .bp-note { font-size: 11px; opacity: 0.65; margin-left: 4px; }
         .bp-more { font-size: 12px; opacity: 0.7; margin-top: 4px; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    cal = calendar.Calendar(firstweekday=6)
-    weeks = cal.monthdatescalendar(int(year), int(month))
+    calx = calendar.Calendar(firstweekday=6)
+    weeks = calx.monthdatescalendar(int(year), int(month))
 
-    def render_calendar(mode: str):
-        schedule = filter_schedule(schedule_all, mode)
-        st.subheader(f"{calendar.month_name[int(month)]} {int(year)} — {mode}")
+    hdr = st.columns(7)
+    for i, lbl in enumerate(SUN_FIRST):
+        hdr[i].markdown(f"**{lbl}**")
 
-        hdr = st.columns(7)
-        for i, lbl in enumerate(SUN_FIRST):
-            hdr[i].markdown(f"**{lbl}**")
+    for week in weeks:
+        cols = st.columns(7)
+        for i, d in enumerate(week):
+            if d.month != int(month):
+                cols[i].markdown("<div class='bp-cell bp-muted'></div>", unsafe_allow_html=True)
+                continue
 
-        for week in weeks:
-            cols = st.columns(7)
-            for i, d in enumerate(week):
-                if d.month != int(month):
-                    cols[i].markdown("<div class='bp-cell bp-muted'></div>", unsafe_allow_html=True)
-                    continue
+            items = schedule.get(d, [])
+            items = sorted(items, key=lambda x: (x.interval_weeks, x.name.lower()))
 
-                items = schedule.get(d, [])
-                shown = items[:14]
-                extra = max(0, len(items) - len(shown))
+            shown = items[:14]
+            extra = max(0, len(items) - len(shown))
 
-                lines = []
-                for it in shown:
-                    lines.append(f"<div class='bp-item'>{it.name} <span style='opacity:0.7'>({it.packs}p)</span></div>")
+            lines = []
+            for it in shown:
+                note_html = ""
+                if getattr(it, "note", ""):
+                    note_html = f"<span class='bp-note'>— {html.escape(it.note)}</span>"
+                lines.append(
+                    f"<div class='bp-item'>{html.escape(it.name)} "
+                    f"<span style='opacity:0.7'>({it.packs}p)</span> {note_html}</div>"
+                )
 
-                more = f"<div class='bp-more'>+{extra} more</div>" if extra > 0 else ""
-                html = f"""
-                <div class="bp-cell">
-                  <div class="bp-date">{d.day}</div>
-                  {''.join(lines)}
-                  {more}
-                </div>
-                """
-                cols[i].markdown(html, unsafe_allow_html=True)
+            more = f"<div class='bp-more'>+{extra} more</div>" if extra > 0 else ""
 
-    for tab, mode in zip(view_tabs, view_modes):
-        with tab:
-            render_calendar(mode)
+            html_block = f"""
+            <div class="bp-cell">
+              <div class="bp-date">{d.day}</div>
+              {''.join(lines)}
+              {more}
+            </div>
+            """
+            cols[i].markdown(html_block, unsafe_allow_html=True)
 
 
 # -------------------------
-# Print tab
+# Print tab (download matches Weekly vs Biweekly+Monthly)
 # -------------------------
 with tab_print:
-    st.subheader("Print Month PDF (Landscape • One Page • Selected Month Only)")
+    st.subheader("Print PDFs (Landscape • One Page • Selected Month Only)")
 
     pc1, pc2, pc3 = st.columns([1, 1, 1.2])
     with pc1:
@@ -1061,7 +1204,7 @@ with tab_print:
         horizontal=True,
     )
 
-    allow_two_cols = st.toggle("Max fit (2 columns inside busy days)", value=True)
+    allow_two_cols = st.toggle("Max fit (use 2 columns inside busy days)", value=True)
     min_font = st.slider("Minimum font size (smaller = fits more)", min_value=3, max_value=6, value=3)
 
     patients_df = read_patients()
@@ -1069,6 +1212,7 @@ with tab_print:
     mstart, mend = month_bounds(int(py), int(pm))
     overrides_df = read_overrides(mstart, mend)
     sched_all = apply_overrides(base, overrides_df)
+
     sched = filter_schedule(sched_all, scope)
 
     pdf_month = make_month_pdf_one_page(
@@ -1082,11 +1226,30 @@ with tab_print:
 
     fname_scope = scope.replace(" ", "_").replace("+", "plus").lower()
     st.download_button(
-        f"Download Month PDF — {scope} (ONE PAGE)",
+        f"Download Month PDF — {scope} (ONE PAGE, Landscape)",
         data=pdf_month,
         file_name=f"bp_month_{py}_{pm:02d}_{fname_scope}.pdf",
         mime="application/pdf",
         type="primary",
     )
 
-    st.caption("If a day is overloaded, PDF shows “+X more” instead of silently dropping names.")
+    st.divider()
+    st.markdown("### Weekly PDF (optional)")
+    any_day = st.date_input("Pick any day in the week to print", value=today, key="weekpick")
+    week_start = any_day - timedelta(days=any_day.weekday())
+
+    week_sched: dict[date, list[DeliveryItem]] = {}
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        base_m = build_month_schedule(d.year, d.month, patients_df)
+        ov_m = read_overrides(*month_bounds(d.year, d.month))
+        base_m = apply_overrides(base_m, ov_m)
+        week_sched[d] = sorted(base_m.get(d, []), key=lambda x: (x.interval_weeks, x.name.lower()))
+
+    pdf_week = make_week_pdf(week_start, week_sched, page_mode=page_mode)
+    st.download_button(
+        f"Download Week PDF (Landscape) — starting {week_start.isoformat()}",
+        data=pdf_week,
+        file_name=f"bp_week_{week_start.isoformat()}.pdf",
+        mime="application/pdf",
+    )
