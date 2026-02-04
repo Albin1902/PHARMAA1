@@ -776,8 +776,8 @@ def make_daily_delivery_pdf(
         rows.append([t, it.name, it.address or "", "", "", ""])  # notes, packages, charged empty
 
     # Add RX blank lines
-    for _ in range(extra_rx_lines):
-        rows.append(["", "", "", "", "", ""])
+    for _ in range(extra_rows):
+    rows.append(["", "", "", "", "", ""])
 
     # Clip rows to one page
     rows = rows[:max_rows]
