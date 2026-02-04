@@ -286,7 +286,7 @@ def make_daily_pdf_one_sheet(
     headers = ["Type", "Patient", "Address", "Notes", "Packages", "Charged"]
 
     # Type short, Address wide, Notes medium
-    col_fracs = [0.10, 0.22, 0.40, 0.18, 0.05, 0.05]  # sums to 1.00
+    col_fracs = [0.10, 0.23, 0.42, 0.13, 0.06, 0.06]  # sums to 1.00
     col_w = [table_w * f for f in col_fracs]
 
     fs_header = 10
@@ -330,8 +330,16 @@ def make_daily_pdf_one_sheet(
 
     x = table_left
     for i, htxt in enumerate(headers):
-        c.drawString(x + 4, table_top - header_h + 8, htxt)
-        x += col_w[i]
+    max_w = col_w[i] - 8
+    label = truncate_to_width(htxt, max_w, "Helvetica-Bold", fs_header)
+
+    # Center the tiny columns so they look clean
+    if htxt in ("Packages", "Charged"):
+        c.drawCentredString(x + (col_w[i] / 2), table_top - header_h + 8, label)
+    else:
+        c.drawString(x + 4, table_top - header_h + 8, label)
+
+    x += col_w[i]
 
     # Vertical lines
     x = table_left
